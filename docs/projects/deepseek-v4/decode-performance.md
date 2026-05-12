@@ -634,6 +634,39 @@ The existing W13 grouped FP4 microbench gives an upper-bound sanity check for th
 
 Interpretation: the next plausible MoE win is not another scalar/row predicate inside the existing capacity launch. The useful prototype should make grouped W13/W2 see active expert problem sizes, ideally using compact active pointer/indptr metadata, while keeping W13 expert-major. The hard production constraint remains host launch sizing: a GPU-only active list cannot directly shrink grid dimensions without D2H, CUDA dynamic parallelism, or a fixed small upper-bound launch. The microbench says the direction is worth prototyping; it does not yet solve the runtime launch-sizing problem.
 
+### Microbench: compact active expert pointer arrays
+
+The W13 grouped FP4 bench now has an active-expert mode:
+
+```bash
+/tmp/w13_grouped_fp4_bench \
+  --experts 32 \
+  --active-experts 3 \
+  --rows-per-active 8 \
+  --warmup 20 \
+  --iters 300 \
+  --seed 44
+```
+
+It builds two equivalent W13 problems over the same rows and the same first-N expert weights:
+
+```text
+capacity: local_experts = 32, expert_indptr has N nonempty experts and the rest empty
+compact:  local_experts = N, compact pointer arrays and compact expert_indptr
+```
+
+Both outputs are bitwise compared against the existing two-GEMM baseline. This directly tests whether merely shrinking the expert dimension of the launch is enough.
+
+5090 results:
+
+| Active experts | Rows per active | Capacity W13 | Compact W13 | Compact speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| `1` | `8` | `0.061482ms` | `0.061479ms` | `1.000x` |
+| `3` | `8` | `0.063062ms` | `0.062033ms` | `1.017x` |
+| `6` | `8` | `0.122831ms` | `0.122831ms` | `1.000x` |
+
+Interpretation: the current TileLang grouped W13 early-return path already makes empty expert slots nearly free for this shape. The performance jumps are tied to how many active expert tiles fit into waves, not to the existence of 32 pointer slots by itself. A useful next prototype must change the actual active GEMM scheduling or fuse across the W13/W2 boundary; compacting pointer arrays alone should not be moved into runtime.
+
 Evidence required for each adoption step:
 
 - vLLM/SGLang source location and whether we copied the decomposition, the kernel shape, or only the validation idea.
@@ -652,6 +685,7 @@ These are worth remembering because they looked plausible:
 | Fuse expand with W13 activation quant | Bitwise microbench PASS and `2.5-3.2x` faster locally, but runtime repeated at `27.20-28.71ms/token` | Local microbench wins that remove only a tiny section can disappear in full decode; require full-runtime proof before retaining. |
 | Skip W2 SwiGLU+quant rows after GPU `local_count` | Exact-safe and hash-stable, but regressed to `31.22-31.34ms/token` | Adding a device-side count read and row predicate inside a tiny regular kernel is the wrong granularity. |
 | Shrink grouped GEMM row-tile bound to `seq_len` | Exact-safe and hash-stable, but regressed to `28.46-28.74ms/token` | Empty row tiles are not the dominant grouped FP4 cost; the expert scheduling dimension remains too coarse. |
+| Compact active expert pointer arrays | Bitwise microbench PASS, but compact W13 was only `1.000-1.017x` versus capacity W13 | Empty expert slots are already cheap in TileLang grouped W13; runtime active-list work needs a different scheduler, not pointer-array compaction alone. |
 | Fuse final HC head plus RMSNorm | Exact-safe but regressed TPOT | Saving small launches can lose to worse reduction/kernel shape. |
 | Reuse deterministic window top-k across layers | Exact-safe, no stable long-bench win | Launch-count reduction alone is weak evidence. |
 | Fuse KV RoPE plus no-PE quant | Exact-safe, regressed short decode | Combining tiny kernels can hurt scheduling/occupancy. |
@@ -772,6 +806,7 @@ Local:
 - rejected W2 valid-row fixed bench log `/tmp/dsv4_valid_rows_bench.log`: aggregate steady TPOT avg `31.270ms`, per-iteration `31.220ms`, `31.342ms`, `31.248ms`; all hash `6346f03343d75a65`
 - rejected grouped GEMM row-tile upper-bound exact E2E log `/tmp/dsv4_max_expert_rows_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - rejected grouped GEMM row-tile upper-bound fixed bench log `/tmp/dsv4_max_expert_rows_bench.log`: per-iteration steady TPOT avg `28.504ms`, `28.460ms`, `28.735ms`; all hash `6346f03343d75a65`
+- active-expert W13 compact-pointer microbench on 5090: `/tmp/w13_grouped_fp4_bench --experts 32 --active-experts {1,3,6} --rows-per-active 8`; bitwise PASS, compact speedup `1.000x`, `1.017x`, `1.000x`
 - `gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
 - `nm -D /tmp/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 
