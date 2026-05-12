@@ -49,6 +49,87 @@ __global__ void deepseek_fill_f32_kernel(float* data, int n, float value) {
   }
 }
 
+constexpr int kSwigluQuantInterDim = 2048;
+constexpr int kSwigluQuantGroupSize = 128;
+constexpr int kSwigluQuantRowsPerBlock = 4;
+constexpr int kSwigluQuantWarpSize = 32;
+constexpr int kSwigluQuantScaleCols = kSwigluQuantInterDim / kSwigluQuantGroupSize;
+
+__global__ void deepseek_swiglu_clamp_act_quant_k2048_kernel(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    unsigned char* __restrict__ out,
+    unsigned char* __restrict__ scales,
+    int rows,
+    float limit) {
+  const int row_block = static_cast<int>(blockIdx.x);
+  const int group = static_cast<int>(blockIdx.y);
+  const int warp = static_cast<int>(threadIdx.x) / kSwigluQuantWarpSize;
+  const int lane = static_cast<int>(threadIdx.x) % kSwigluQuantWarpSize;
+  const int row = row_block * kSwigluQuantRowsPerBlock + warp;
+
+  float activated[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float amax = 0.0f;
+  if (row < rows) {
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+      const int col = lane + item * kSwigluQuantWarpSize;
+      const int idx = row * kSwigluQuantInterDim + group * kSwigluQuantGroupSize + col;
+      float gate_value = __bfloat162float(gate[idx]);
+      float up_value = __bfloat162float(up[idx]);
+      if (limit > 0.0f) {
+        gate_value = fminf(gate_value, limit);
+        up_value = fminf(fmaxf(up_value, -limit), limit);
+      }
+      const float silu_gate = gate_value / (1.0f + expf(-gate_value));
+      activated[item] = round_to_bf16_float(silu_gate * up_value);
+      amax = fmaxf(amax, fabsf(activated[item]));
+    }
+  }
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, offset));
+  }
+  const float rounded_amax = fmaxf(__shfl_sync(0xffffffff, amax, 0), 1.0e-4f);
+  const unsigned char scale_e8m0 = float_to_e8m0(rounded_amax / 448.0f);
+  const float scale = e8m0_to_float(scale_e8m0);
+
+  if (row < rows) {
+    if (lane == 0) {
+      scales[row * kSwigluQuantScaleCols + group] = scale_e8m0;
+    }
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+      const int col = lane + item * kSwigluQuantWarpSize;
+      const float q = fminf(fmaxf(activated[item] / scale, -448.0f), 448.0f);
+      out[row * kSwigluQuantInterDim + group * kSwigluQuantGroupSize + col] =
+          float_to_fp8_e4m3(q);
+    }
+  }
+}
+
+static cudaError_t deepseek_swiglu_clamp_act_quant_k2048_cuda(
+    const __nv_bfloat16* gate,
+    const __nv_bfloat16* up,
+    unsigned char* out,
+    unsigned char* scales,
+    int rows,
+    float limit,
+    cudaStream_t stream) {
+  if (rows < 0) return cudaErrorInvalidValue;
+  if (rows == 0) return cudaSuccess;
+  if (gate == nullptr || up == nullptr || out == nullptr || scales == nullptr) {
+    return cudaErrorInvalidDevicePointer;
+  }
+  dim3 grid((rows + kSwigluQuantRowsPerBlock - 1) / kSwigluQuantRowsPerBlock,
+            kSwigluQuantScaleCols,
+            1);
+  deepseek_swiglu_clamp_act_quant_k2048_kernel<<<grid, 128, 0, stream>>>(
+      gate, up, out, scales, rows, limit);
+  return cudaGetLastError();
+}
+
 __global__ void deepseek_fp8_quantize_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,
     unsigned char* __restrict__ out,
@@ -316,6 +397,18 @@ extern "C" int deepseek_tilelang_fp8_gemm_n2048_k4096(
     int m,
     cudaStream_t stream);
 
+extern "C" int deepseek_tilelang_fp8_w13_gemm_n2048_k4096(
+    const void* a,
+    const void* w1,
+    const void* w3,
+    void* gate_out,
+    void* up_out,
+    const void* scales_a,
+    const void* scales_w1,
+    const void* scales_w3,
+    int m,
+    cudaStream_t stream);
+
 extern "C" int deepseek_tilelang_fp8_gemm_n4096_k1024(
     const void* a,
     const void* b,
@@ -573,6 +666,181 @@ static cudaError_t deepseek_moe_fp4_grouped_w1_w3_workspace_cuda(
   return err == cudaSuccess ? cudaGetLastError() : err;
 }
 
+static cudaError_t deepseek_moe_fp4_grouped_w2_swiglu_workspace_cuda(
+    const __nv_bfloat16 *gate,
+    const __nv_bfloat16 *up,
+    const unsigned char *const *weights,
+    const unsigned char *const *scales,
+    const int *expert_indptr,
+    __nv_bfloat16 *out,
+    unsigned char *act,
+    size_t act_bytes,
+    unsigned char *act_scale,
+    size_t act_scale_bytes,
+    int rows,
+    int in_dim,
+    int out_dim,
+    int local_experts,
+    float limit,
+    cudaStream_t stream) {
+  if (rows < 0 || in_dim <= 0 || out_dim <= 0 || local_experts <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (rows == 0) return cudaSuccess;
+  if (gate == nullptr || up == nullptr || weights == nullptr || scales == nullptr ||
+      expert_indptr == nullptr || out == nullptr || act == nullptr || act_scale == nullptr) {
+    return cudaErrorInvalidDevicePointer;
+  }
+  if (in_dim != 2048 || out_dim != 4096) {
+    return cudaErrorNotSupported;
+  }
+
+  DeepseekTilelangActQuantFn act_fn = nullptr;
+  DeepseekTilelangGroupedFp4GemmFn gemm_fn = nullptr;
+  if (!deepseek_tilelang_grouped_fp4_linear_fns(in_dim, out_dim, &act_fn, &gemm_fn)) {
+    return cudaErrorNotSupported;
+  }
+
+  const int scale_cols = (in_dim + 127) / 128;
+  const size_t required_act_bytes = (size_t)rows * (size_t)in_dim;
+  const size_t required_act_scale_bytes = (size_t)rows * (size_t)scale_cols;
+  if (act_bytes < required_act_bytes || act_scale_bytes < required_act_scale_bytes) {
+    return cudaErrorInvalidValue;
+  }
+
+  cudaError_t err = deepseek_swiglu_clamp_act_quant_k2048_cuda(
+      gate, up, act, act_scale, rows, limit, stream);
+  if (err != cudaSuccess) return err;
+
+  err = static_cast<cudaError_t>(gemm_fn(
+      act,
+      reinterpret_cast<const void* const*>(weights),
+      out,
+      act_scale,
+      reinterpret_cast<const void* const*>(scales),
+      expert_indptr,
+      rows,
+      local_experts,
+      stream));
+  return err == cudaSuccess ? cudaGetLastError() : err;
+}
+
+static cudaError_t deepseek_fp8_w1_w3_workspace_cuda(
+    const __nv_bfloat16 *x,
+    const unsigned char *w1_weight,
+    const unsigned char *w1_scale,
+    const unsigned char *w3_weight,
+    const unsigned char *w3_scale,
+    __nv_bfloat16 *gate_out,
+    __nv_bfloat16 *up_out,
+    unsigned char *act,
+    size_t act_bytes,
+    unsigned char *act_scale,
+    size_t act_scale_bytes,
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    cudaStream_t stream) {
+  if (seq_len < 0 || in_dim <= 0 || out_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (seq_len == 0) return cudaSuccess;
+  if (x == nullptr || w1_weight == nullptr || w1_scale == nullptr ||
+      w3_weight == nullptr || w3_scale == nullptr || gate_out == nullptr ||
+      up_out == nullptr || act == nullptr || act_scale == nullptr) {
+    return cudaErrorInvalidDevicePointer;
+  }
+
+  DeepseekTilelangActQuantFn act_fn = nullptr;
+  DeepseekTilelangFp8GemmFn gemm_fn = nullptr;
+  if (!deepseek_tilelang_fp8_linear_fns(in_dim, out_dim, &act_fn, &gemm_fn)) {
+    return cudaErrorNotSupported;
+  }
+
+  const int scale_cols = (in_dim + 127) / 128;
+  const size_t required_act_bytes = (size_t)seq_len * (size_t)in_dim;
+  const size_t required_act_scale_bytes = (size_t)seq_len * (size_t)scale_cols;
+  if (act_bytes < required_act_bytes || act_scale_bytes < required_act_scale_bytes) {
+    return cudaErrorInvalidValue;
+  }
+
+  cudaError_t err = static_cast<cudaError_t>(
+      act_fn(x, act, act_scale, seq_len, stream));
+  if (err != cudaSuccess) return err;
+
+  if (in_dim == 4096 && out_dim == 2048) {
+    err = static_cast<cudaError_t>(deepseek_tilelang_fp8_w13_gemm_n2048_k4096(
+        act,
+        w1_weight,
+        w3_weight,
+        gate_out,
+        up_out,
+        act_scale,
+        w1_scale,
+        w3_scale,
+        seq_len,
+        stream));
+    return err == cudaSuccess ? cudaGetLastError() : err;
+  }
+
+  err = static_cast<cudaError_t>(
+      gemm_fn(act, w1_weight, gate_out, act_scale, w1_scale, seq_len, stream));
+  if (err != cudaSuccess) return err;
+
+  err = static_cast<cudaError_t>(
+      gemm_fn(act, w3_weight, up_out, act_scale, w3_scale, seq_len, stream));
+  return err == cudaSuccess ? cudaGetLastError() : err;
+}
+
+static cudaError_t deepseek_fp8_w2_swiglu_workspace_cuda(
+    const __nv_bfloat16 *gate,
+    const __nv_bfloat16 *up,
+    const unsigned char *weight,
+    const unsigned char *weight_scale,
+    __nv_bfloat16 *out,
+    unsigned char *act,
+    size_t act_bytes,
+    unsigned char *act_scale,
+    size_t act_scale_bytes,
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    float limit,
+    cudaStream_t stream) {
+  if (seq_len < 0 || in_dim <= 0 || out_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (seq_len == 0) return cudaSuccess;
+  if (gate == nullptr || up == nullptr || weight == nullptr || weight_scale == nullptr ||
+      out == nullptr || act == nullptr || act_scale == nullptr) {
+    return cudaErrorInvalidDevicePointer;
+  }
+  if (in_dim != 2048 || out_dim != 4096) {
+    return cudaErrorNotSupported;
+  }
+
+  DeepseekTilelangActQuantFn act_fn = nullptr;
+  DeepseekTilelangFp8GemmFn gemm_fn = nullptr;
+  if (!deepseek_tilelang_fp8_linear_fns(in_dim, out_dim, &act_fn, &gemm_fn)) {
+    return cudaErrorNotSupported;
+  }
+
+  const int scale_cols = (in_dim + 127) / 128;
+  const size_t required_act_bytes = (size_t)seq_len * (size_t)in_dim;
+  const size_t required_act_scale_bytes = (size_t)seq_len * (size_t)scale_cols;
+  if (act_bytes < required_act_bytes || act_scale_bytes < required_act_scale_bytes) {
+    return cudaErrorInvalidValue;
+  }
+
+  cudaError_t err = deepseek_swiglu_clamp_act_quant_k2048_cuda(
+      gate, up, act, act_scale, seq_len, limit, stream);
+  if (err != cudaSuccess) return err;
+
+  err = static_cast<cudaError_t>(
+      gemm_fn(act, weight, out, act_scale, weight_scale, seq_len, stream));
+  return err == cudaSuccess ? cudaGetLastError() : err;
+}
+
 static cudaError_t deepseek_fp8_linear_tilelang_cuda(
     const __nv_bfloat16 *x,
     const unsigned char *weight,
@@ -712,6 +980,47 @@ cleanup:
   if (act_scale) cudaFree(act_scale);
   if (act) cudaFree(act);
   return err == cudaSuccess ? cudaGetLastError() : err;
+}
+
+cudaError_t deepseek_fp8_w1_w3_with_workspace_cuda(
+    const __nv_bfloat16 *x,
+    const unsigned char *w1_weight,
+    const unsigned char *w1_scale,
+    const unsigned char *w3_weight,
+    const unsigned char *w3_scale,
+    __nv_bfloat16 *gate_out,
+    __nv_bfloat16 *up_out,
+    unsigned char *act,
+    size_t act_bytes,
+    unsigned char *act_scale,
+    size_t act_scale_bytes,
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    cudaStream_t stream) {
+  return deepseek_fp8_w1_w3_workspace_cuda(
+      x, w1_weight, w1_scale, w3_weight, w3_scale, gate_out, up_out,
+      act, act_bytes, act_scale, act_scale_bytes, seq_len, in_dim, out_dim, stream);
+}
+
+cudaError_t deepseek_fp8_w2_swiglu_with_workspace_cuda(
+    const __nv_bfloat16 *gate,
+    const __nv_bfloat16 *up,
+    const unsigned char *weight,
+    const unsigned char *weight_scale,
+    __nv_bfloat16 *out,
+    unsigned char *act,
+    size_t act_bytes,
+    unsigned char *act_scale,
+    size_t act_scale_bytes,
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    float limit,
+    cudaStream_t stream) {
+  return deepseek_fp8_w2_swiglu_workspace_cuda(
+      gate, up, weight, weight_scale, out, act, act_bytes, act_scale,
+      act_scale_bytes, seq_len, in_dim, out_dim, limit, stream);
 }
 
 cudaError_t deepseek_fp8_act_quant_nope_bf16_cuda(
@@ -1025,6 +1334,29 @@ cudaError_t deepseek_moe_fp4_grouped_w1_w3_with_workspace_cuda(
       x, w1_weights, w1_scales, w3_weights, w3_scales, expert_indptr,
       gate_out, up_out, act, act_bytes, act_scale, act_scale_bytes,
       rows, in_dim, out_dim, local_experts, stream);
+}
+
+cudaError_t deepseek_moe_fp4_grouped_w2_swiglu_with_workspace_cuda(
+    const __nv_bfloat16 *gate,
+    const __nv_bfloat16 *up,
+    const unsigned char *const *weights,
+    const unsigned char *const *scales,
+    const int *expert_indptr,
+    __nv_bfloat16 *out,
+    unsigned char *act,
+    size_t act_bytes,
+    unsigned char *act_scale,
+    size_t act_scale_bytes,
+    int rows,
+    int in_dim,
+    int out_dim,
+    int local_experts,
+    float limit,
+    cudaStream_t stream) {
+  return deepseek_moe_fp4_grouped_w2_swiglu_workspace_cuda(
+      gate, up, weights, scales, expert_indptr, out,
+      act, act_bytes, act_scale, act_scale_bytes,
+      rows, in_dim, out_dim, local_experts, limit, stream);
 }
 
 }  // extern "C"

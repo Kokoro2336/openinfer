@@ -562,6 +562,45 @@ def grouped_fp4_w13_gemm_kernel_source(inter_dim: int, in_dim: int, kernel_name:
     return source
 
 
+def fp8_w13_gemm_kernel_source(inter_dim: int, in_dim: int, kernel_name: str) -> str:
+    source = renamed_kernel_source(
+        fp8_gemm_kernel(inter_dim, in_dim),
+        "fp8_gemm_kernel__kernel",
+        kernel_name,
+    )
+    old_args = (
+        "const fp8_e4_t* __restrict__ A, const fp8_e4_t* __restrict__ B, "
+        "bfloat16_t* __restrict__ C, const fp8_e8_t* __restrict__ scales_a, "
+        "const fp8_e8_t* __restrict__ scales_b, int M"
+    )
+    new_args = (
+        "const fp8_e4_t* __restrict__ A, "
+        "const fp8_e4_t* __restrict__ W1, "
+        "const fp8_e4_t* __restrict__ W3, "
+        "bfloat16_t* __restrict__ gate_out, "
+        "bfloat16_t* __restrict__ up_out, "
+        "const fp8_e8_t* __restrict__ scales_a, "
+        "const fp8_e8_t* __restrict__ W1_scales, "
+        "const fp8_e8_t* __restrict__ W3_scales, int M"
+    )
+    if old_args not in source:
+        raise RuntimeError("TileLang FP8 GEMM signature changed; update W13 transform")
+    source = source.replace(old_args, new_args)
+    source = source.replace("((int)blockIdx.x)", "local_block_x")
+    setup = f"""  const int global_block_x = static_cast<int>(blockIdx.x);
+  const bool is_w3 = global_block_x >= {inter_dim // 128};
+  const int local_block_x = is_w3 ? global_block_x - {inter_dim // 128} : global_block_x;
+  const fp8_e4_t* __restrict__ B = is_w3 ? W3 : W1;
+  bfloat16_t* __restrict__ C = is_w3 ? up_out : gate_out;
+  const fp8_e8_t* __restrict__ scales_b = is_w3 ? W3_scales : W1_scales;
+"""
+    marker = "  const dim3 blockIdx = tl::rasterization2DRow<10>();\n"
+    if marker not in source:
+        raise RuntimeError("TileLang FP8 GEMM blockIdx marker changed; update W13 transform")
+    source = source.replace(marker, marker + setup)
+    return source
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", required=True)
@@ -650,6 +689,47 @@ extern "C" int deepseek_tilelang_fp8_gemm_n{out_dim}_k{in_dim}(
 }}
 """
         )
+
+        if out_dim == 2048 and in_dim == 4096:
+            w13_name = f"deepseek_tilelang_fp8_w13_gemm_n{out_dim}_k{in_dim}_kernel"
+            sources.append(fp8_w13_gemm_kernel_source(out_dim, in_dim, w13_name))
+            launchers.append(
+                f"""
+extern "C" int deepseek_tilelang_fp8_w13_gemm_n{out_dim}_k{in_dim}(
+    const void* a,
+    const void* w1,
+    const void* w3,
+    void* gate_out,
+    void* up_out,
+    const void* scales_a,
+    const void* scales_w1,
+    const void* scales_w3,
+    int m,
+    cudaStream_t stream) {{
+  constexpr int kThreads = 128;
+  constexpr int kSharedBytes = 98304;
+  cudaError_t err = cudaFuncSetAttribute(
+      {w13_name},
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      kSharedBytes);
+  if (err != cudaSuccess && err != cudaErrorInvalidValue && err != cudaErrorNotSupported) {{
+    return static_cast<int>(err);
+  }}
+  dim3 grid({(out_dim // 128) * 2}, (m + 31) / 32, 1);
+  {w13_name}<<<grid, kThreads, kSharedBytes, stream>>>(
+      reinterpret_cast<const fp8_e4_t*>(a),
+      reinterpret_cast<const fp8_e4_t*>(w1),
+      reinterpret_cast<const fp8_e4_t*>(w3),
+      reinterpret_cast<bfloat16_t*>(gate_out),
+      reinterpret_cast<bfloat16_t*>(up_out),
+      reinterpret_cast<const fp8_e8_t*>(scales_a),
+      reinterpret_cast<const fp8_e8_t*>(scales_w1),
+      reinterpret_cast<const fp8_e8_t*>(scales_w3),
+      m);
+  return static_cast<int>(cudaGetLastError());
+}}
+"""
+            )
 
     for _shape_name, out_dim, in_dim in FP4_LINEAR_SHAPES:
         gemm_name = f"deepseek_tilelang_fp4_gemm_n{out_dim}_k{in_dim}_kernel"

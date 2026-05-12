@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current `31.99-34.22ms/token` W13 runtime branch, with shared-quant-only validation at `33.33-34.29ms/token` and prior same-code fast runs at `32.75-33.90ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, and benchmark/counter instrumentation. The active MoE goal is stable sub-`30ms/token` decode by reducing local expert launch/intermediate work without bs=1 specialization. Exact E2E remains `20/20`, and the fixed bench token hash remains `6346f03343d75a65`.
+This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current shared-expert fused branch at `28.16-32.22ms/token`, with routed W13+SwiGLU-quant validation at `31.18-33.42ms/token`, W13-only validation at `31.99-34.22ms/token`, and shared-quant-only validation at `33.33-34.29ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, routed fused SwiGLU+W2 activation quantization, shared expert fused W1/W3 quant, shared fused SwiGLU+W2 quant, shared dense FP8 W13, and benchmark/counter instrumentation. The active MoE goal is stable sub-`30ms/token` decode first, then sub-`25ms/token`, by mirroring mature vLLM/SGLang decode MoE decomposition and only then exploring deeper fusion without bs=1 specialization. Exact E2E remains `20/20`, and the fixed bench token hash remains `6346f03343d75a65`.
 
 The retained team lessons are more important than the discarded attempt logs: compare identical token traces, separate NCCL wait from transfer, treat capacity and logical length separately, keep MoE semantic zero on device, and prove allocation cleanup with application-visible CUDA API counters rather than nsys attribution alone.
 
@@ -35,6 +35,8 @@ target/release/bench_serving \
 | Final PR validation | `35.253ms/token` | After review fixes: dynamic NUMA topology, buffer-derived capacity checks, and `_ptsz` counter separation. |
 | Shared W1/W3 act quant | `33.330ms`, repeated `34.289ms` | Decode scratch W1 and W3 reuse one TileLang `act_quant_k4096`; token hash stays `6346f03343d75a65`, exact E2E `20/20`. |
 | W13 grouped runtime launch | text `34.22ms`, JSON `31.986ms` | W1 and W3 share one TileLang grouped FP4 launch after shared activation quant; token hash stays `6346f03343d75a65`, exact E2E `20/20`. |
+| Routed fused SwiGLU + W2 act quant | `33.416ms`, repeated `31.180ms` | Mirror vLLM/SGLang's activation+quant fusion after materialized W13 output; token hash stays `6346f03343d75a65`, exact E2E `20/20`. |
+| Shared expert fused quant + dense W13 | `29.764ms`, repeated `31.592ms` | Shared expert scratch path reuses one FP8 act quant for W1/W3, fuses shared SwiGLU+W2 act quant, and uses one dense FP8 W13 launch; token hash stays `6346f03343d75a65`, exact E2E `20/20`. |
 
 Final PR validation on 5090:
 
@@ -90,7 +92,7 @@ Do not encode ordinal assumptions such as `GPU0..3 -> NUMA0`. A review caught th
 | Entry hidden | `DecodeEntryScratch` | Embedding and HC expand outputs are fully overwritten. |
 | HC pre/post | `HcPreNormScratch`, `HcPostScratch` | HC pre-state and layer outputs reuse rank-owned buffers; HC post layer output uses ping-pong slots to avoid adjacent-layer aliasing. |
 | Attention | `AttentionProjectionScratch`, `AttentionIndexScratch`, `AttentionAuxScratch`, `AttentionOutputScratch` | Active ratio `0` and ratio `4` decode paths use capacity buffers with logical lengths passed separately. |
-| Shared expert | `SharedExpertScratch` | Fixed-shape gate/up/activation/out storage. |
+| Shared expert | `SharedExpertScratch` | Fixed-shape gate/up/out storage plus caller-owned FP8 activation/scale workspace for shared W1/W3 and W2. |
 | MoE AG/RS | `MoeAgRsScratch` | Hidden/token all-gather, route buffers, compact maps, expert intermediates, partial routed output, local reduce-scatter output, routed+shared output. |
 | Grouped FP4 workspace | `MoeAgRsScratch::{fp4_act_workspace,fp4_act_scale_workspace}` | Caller-owned workspace avoids the C-side grouped FP4 growth-cache/mutex path. |
 | Final logits | `FinalLogitsScratch` | HC head, final norm, local logits, and gathered logits are reusable. |
@@ -263,6 +265,140 @@ Runtime validation on 5090:
 
 Interpretation: W13 is exact at the operator level and in runtime, but the speedup depends heavily on routed-row distribution, local expert count, and run-to-run system noise. It is not automatically a `2x` W1/W3 win; some shapes mainly save launch overhead, while others are dominated by the expanded grid and grouped scheduling. Keep the runtime change because it removes one launch per layer and preserves the fixed token trace, but do not count the `31.986ms` run as stable sub-32 evidence until repeated long benches confirm it.
 
+### Roadmap: mirror vLLM and SGLang decode MoE
+
+The next long-running goal is to systematically absorb the mature vLLM/SGLang decode MoE decomposition and push beyond it only after the reproduced path is stable. The performance target is stable sub-`25ms/token` eventually, with stable sub-`30ms/token` as the first gate. This work remains batch-general and expert-general; do not introduce bs=1 or seq_len=1 special cases.
+
+Reference source positions:
+
+| Runtime | Source | Observed decode MoE shape |
+| --- | --- | --- |
+| vLLM | `/data/code/workspace-rustllm/vllm/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py` | `cutlass_fp4_moe_mm(c1, W13)` writes `gate||up`, then `silu_and_mul_scaled_fp4_experts_quant(c1, ...)`, then `cutlass_fp4_moe_mm(W2)`. MXFP4 uses the same split with `silu_and_mul_mxfp4_experts_quant`. |
+| vLLM C++ op registry | `/data/code/workspace-rustllm/vllm/csrc/libtorch_stable/torch_bindings.cpp` | Registers `silu_and_mul_scaled_fp4_experts_quant`, `silu_and_mul_mxfp4_experts_quant`, and grouped FP4/MXFP4 MoE GEMMs as separate ops. |
+| SGLang | `/data/code/workspace-rustllm/sglang/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py` | `grouped_gemm_nt_f8f8bf16_masked` writes `gateup_output`, then `sglang_per_token_group_quant_8bit(..., fuse_silu_and_mul=True)`, then W2 grouped GEMM. |
+| SGLang C++ quant | `/data/code/workspace-rustllm/sglang/sgl-kernel/csrc/gemm/per_token_group_quant_8bit_v2.cu` | The `fuse_silu_and_mul` path fuses activation with group quant, including masked expert layout. |
+
+Current PegaInfer path after W13:
+
+```text
+act_quant(expanded_input)
+W13 grouped FP4 GEMM -> gate BF16 + up BF16
+deepseek_swiglu_clamp_cuda -> activated BF16
+TileLang act_quant_k2048(activated) inside W2 wrapper
+W2 grouped FP4 GEMM
+```
+
+First reproduction target:
+
+```text
+act_quant(expanded_input)
+W13 grouped FP4 GEMM -> gate BF16 + up BF16
+fused SwiGLU clamp + BF16 semantic rounding + TileLang-compatible act_quant_k2048
+W2 grouped FP4 GEMM using the produced FP8 activation and E8M0 scales
+```
+
+This mirrors vLLM/SGLang's proven operator split while preserving our exact semantic order. It still writes `gate/up` BF16 because vLLM and SGLang also materialize `gate||up` before activation+quant. The later, higher-risk path is to push activation+quant into the W13 accumulator epilogue and avoid writing `gate/up`; that requires separate microbench and fuzz evidence before runtime integration.
+
+The standalone tool `pegainfer-kernels/tools/deepseek_v4/swiglu_quant_bench.cu` compares:
+
+```text
+baseline: deepseek_swiglu_clamp_cuda + TileLang act_quant_k2048
+candidate: 4-warp fused SwiGLU clamp + BF16 rounding + FP8/E8M0 quant
+```
+
+The first fused kernel used one CTA to serially process 32 rows. It was exact but too slow: rows `64` measured baseline `0.007064ms` vs fused `0.016471ms`, speedup `0.429x`. That shape was dropped. The retained microbench shape uses one warp per row and one CTA for four rows per 128-column group.
+
+5090 microbench results:
+
+| Rows | Fuzz | Baseline SwiGLU+act_quant | Fused SwiGLU+quant | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| `64` | PASS | `0.005612ms` | `0.002789ms` | `2.013x` |
+| `96` | PASS | `0.005574ms` | `0.003139ms` | `1.776x` |
+| `160` | PASS | `0.006164ms` | `0.004054ms` | `1.520x` |
+| `256` | PASS | `0.007793ms` | `0.004073ms` | `1.914x` |
+
+Runtime integration changes only the scratch hot path:
+
+```text
+W13 grouped FP4 GEMM -> gate BF16 + up BF16
+deepseek_moe_fp4_grouped_w2_swiglu_with_workspace_cuda
+  -> fused SwiGLU+act_quant_k2048-compatible FP8 activation
+  -> W2 grouped FP4 GEMM
+```
+
+The old Rust scratch helper that performed generic grouped W2 activation quantization was removed so the decode path does not accidentally drift back to the split version. The lower C FFI remains for non-scratch compatibility and older callers.
+
+Runtime validation on 5090:
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --check` | passed |
+| `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
+| fixed bench JSON run 1 | steady TPOT avg `33.416ms`, p50 `32.884ms`, p95 `35.510ms`, first decode avg `31.885ms`, hash `6346f03343d75a65` |
+| fixed bench JSON run 2 | steady TPOT avg `31.180ms`, p50 `30.675ms`, p95 `33.151ms`, first decode avg `30.020ms`, hash `6346f03343d75a65` |
+
+Keep decision: retain as the vLLM/SGLang reproduction step. It is exact, removes one kernel launch and one BF16 intermediate write for W2 activation input, and the second fixed run matches the faster W13-only band. It is not sufficient for stable sub-`30ms/token`; the next step needs to explain remaining variance and reduce a larger section than activation+quant alone.
+
+### Retained: shared expert fused decode path
+
+The routed expert path was no longer the only split-MoE region. The shared expert decode scratch path still did:
+
+```text
+FP8 W1(input) with act_quant_k4096 -> gate BF16
+FP8 W3(input) with act_quant_k4096 -> up BF16
+SwiGLU clamp -> activated BF16
+FP8 W2(activated) with act_quant_k2048 -> shared output
+```
+
+The retained shared path now does:
+
+```text
+act_quant_k4096(input) once
+dense FP8 W13 -> gate BF16 + up BF16
+fused SwiGLU clamp + BF16 rounding + FP8/E8M0 quant
+FP8 W2 -> shared output
+```
+
+Implementation notes:
+
+- `SharedExpertScratch` owns FP8 activation and scale workspaces so the shared scratch path does not use the C-side growth-cache/mutex path.
+- `deepseek_fp8_w1_w3_with_workspace_cuda` reuses one activation quant for shared W1/W3 and calls the dense W13 TileLang kernel for the `4096 -> 2048` shared-expert shape.
+- `deepseek_fp8_w2_swiglu_with_workspace_cuda` reuses the same fused SwiGLU+quant semantic order as the routed W2 path before calling the dense `4096 x 2048` FP8 W2 GEMM.
+- `deepseek_tilelang_fp8_w13_gemm_n2048_k4096` is generated by transforming the existing dense FP8 TileLang GEMM into a two-output W1/W3 launcher. It is shape-specific to the shared expert, not bs=1 or seq_len=1 specific.
+
+5090 validation:
+
+| Check | Result |
+| --- | --- |
+| local `cargo fmt --check` | passed |
+| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| 5090 `cargo fmt --check` | passed |
+| 5090 `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
+| fixed bench JSON run 1 | steady TPOT avg `29.764ms`, p50 `29.296ms`, p95 `31.766ms`, first decode avg `28.575ms`, hash `6346f03343d75a65` |
+| fixed bench JSON run 2 | steady TPOT avg `31.592ms`, p50 `31.082ms`, p95 `33.699ms`, first decode avg `30.019ms`, hash `6346f03343d75a65` |
+| additional fixed repeats | `32.220ms`, `30.061ms`, `28.159ms`, all hash `6346f03343d75a65` |
+
+Short nsys composition evidence, collected with `--output-len 32 --warmup 1 --iters 1 --seed 42` and used only for kernel composition, not TPOT:
+
+| Kernel family | Evidence |
+| --- | --- |
+| Shared W13 | `deepseek_tilelang_fp8_w13_gemm_n2048_k4096_kernel` appears with `10,151` instances in the short full-process profile. |
+| Old shared W1/W3 split GEMM | `deepseek_tilelang_fp8_gemm_n2048_k4096_kernel` drops to `1,118` residual instances, consistent with prefill/non-scratch residue rather than the decode scratch hot path. |
+| Shared W2 activation quant | `deepseek_tilelang_act_quant_k2048_kernel` drops to `1,118` residual instances after fused shared/routed W2 quant. |
+| Old SwiGLU clamp | `deepseek_swiglu_clamp_kernel` drops to `1,118` residual instances after decode scratch fusion. |
+
+Keep decision: retain. This is the first run to cross sub-`30ms/token`, and the kernel composition proves the intended launches moved. It still does not satisfy the goal because repeated fixed runs returned `29.764ms`, `31.592ms`, `32.220ms`, `30.061ms`, and `28.159ms`; the current blocker is run-to-run variance and remaining synchronization windows, not exactness or missing vLLM/SGLang decomposition.
+
+Evidence required for each adoption step:
+
+- vLLM/SGLang source location and whether we copied the decomposition, the kernel shape, or only the validation idea.
+- standalone microbench with fuzz against the current PegaInfer baseline.
+- exact E2E `20/20`.
+- fixed JSON bench with token hash `6346f03343d75a65`.
+- repeated TPOT range, not a single fast run.
+
 ## Rejected Patterns
 
 These are worth remembering because they looked plausible:
@@ -281,6 +417,28 @@ These are worth remembering because they looked plausible:
 ### Token trace first
 
 Always compare generated-token hashes before comparing TPOT. DeepSeek V4 routing and expert balance depend on token sequence. The bench JSON now records per-iteration timing and generated-token trace.
+
+### Repeated fixed bench before claiming a win
+
+The shared W13 branch showed a wide fixed-bench band with the same token hash: `32.220ms`, `30.061ms`, and `28.159ms` across consecutive 5090 repeats. A single sub-`30ms/token` run is therefore only evidence that the code path can enter that band, not that the optimization goal is achieved. Record multiple full JSON runs and prefer ranges over point estimates.
+
+After the repeat series, idle `nvidia-smi` showed all GPUs back at `180MHz` SM / `405MHz` memory with no active throttle reason and no remaining `bench_serving`/`deepseek_v4`/`nsys` process. A follow-up fixed bench with `nvidia-smi --loop-ms 200` sampling produced steady TPOT `28.784ms` with all token hashes still `6346f03343d75a65`. Active-window clock averages were roughly `2622-2699MHz` SM and `13.7-13.8GHz` memory across ranks, with throttle reason always `0x0000000000000000`. That weakens the simple “slow run equals thermal/power throttle” hypothesis. The next diagnostic should add per-rank decode stage timestamps around attention local, collectives, routed MoE, shared expert, and logits to catch rank-arrival skew directly.
+
+A temporary hard-coded trace for `start_pos == 80` synchronized each rank stream between broad decode stages, then logged per-rank totals. The trace build itself perturbs one steady token, so use it only for attribution. In one fixed bench with trace enabled, TPOT stayed in the fast band at `29.630ms` and all token hashes stayed `6346f03343d75a65`.
+
+Trace summary across the 5 traced requests (`2` warmup + `3` measured), aggregated over all layers for a single steady decode token:
+
+| Stage | Median / avg shape | Cross-rank range observed |
+| --- | ---: | ---: |
+| `attention_local` | avg `16.756ms` | `15.099-17.846ms` |
+| `attention_collective_post` | avg `3.741ms` | `2.990-6.225ms` |
+| `moe` | avg `15.112ms` | `14.779-15.401ms` |
+| `hc_attn_pre` | avg `2.179ms` | `2.063-2.469ms` |
+| `hc_ffn_pre` | avg `2.248ms` | `2.158-2.345ms` |
+| `ffn_post` | avg `0.533ms` | `0.463-0.604ms` |
+| `final_logits` | avg `0.268ms` | `0.241-0.352ms` |
+
+Interpretation: the current shared/routed MoE path is not the largest source of rank skew in this trace. MoE is still a large absolute cost, but its rank range is only about `0.6ms`; the larger variance comes from attention local and attention collective+HC-post windows. The next optimization pass should not blindly keep fusing MoE kernels before explaining attention-local variability.
 
 ### NCCL wall is wait-inclusive
 
@@ -308,7 +466,7 @@ The counter exports base and `_ptsz` wrappers separately for `cuMemAllocAsync`, 
 
 ## Remote Workflow Notes
 
-Remote test syncs should use touched-file `rsync -azR`. A full repository rsync with delete/excludes stalled for about 10 minutes during this work. Also, `cargo check` does not rebuild already-built release binaries; rebuild `deepseek_v4_e2e` and `bench_serving` before trusting remote validation.
+Remote test syncs should use touched-file `rsync -azR`. A full repository rsync with delete/excludes stalled for about 10 minutes during this work. A repeated mistake here was running multi-source `rsync` without `-R`, which copied `index.md`, `decode-performance.md`, `core.rs`, `moe.rs`, `state.rs`, `deepseek_quant.cu`, `ffi.rs`, and `swiglu_quant_bench.cu` into the remote repository root as basename files. Clean those accidental root files immediately and resend with `-R` so paths are preserved. Also, `cargo check` does not rebuild already-built release binaries; rebuild `deepseek_v4_e2e` and `bench_serving` before trusting remote validation.
 
 Verified command set for this PR:
 

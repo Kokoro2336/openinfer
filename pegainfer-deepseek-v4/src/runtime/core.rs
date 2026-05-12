@@ -1447,6 +1447,233 @@ pub(crate) fn fp8_linear_bf16_hidden_into(
     Ok(())
 }
 
+pub(crate) fn fp8_w1_w3_bf16_hidden_into(
+    ctx: &RankGpuContext,
+    input: &Bf16HiddenStates,
+    w1: &QuantLinearRef<'_>,
+    w3: &QuantLinearRef<'_>,
+    gate_out: &mut Bf16HiddenStates,
+    up_out: &mut Bf16HiddenStates,
+    act_workspace: &mut CudaSlice<u8>,
+    act_scale_workspace: &mut CudaSlice<u8>,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        w1.weight.tensor.dtype == safetensors::Dtype::F8_E4M3
+            && w3.weight.tensor.dtype == safetensors::Dtype::F8_E4M3,
+        "shared W1/W3 weights must be F8_E4M3, got {:?}/{:?}",
+        w1.weight.tensor.dtype,
+        w3.weight.tensor.dtype
+    );
+    ensure!(
+        w1.scale.tensor.dtype == safetensors::Dtype::F8_E8M0
+            && w3.scale.tensor.dtype == safetensors::Dtype::F8_E8M0,
+        "shared W1/W3 scales must be F8_E8M0, got {:?}/{:?}",
+        w1.scale.tensor.dtype,
+        w3.scale.tensor.dtype
+    );
+    ensure!(
+        w1.weight.tensor.shape.len() == 2 && w3.weight.tensor.shape.len() == 2,
+        "shared W1/W3 weights must be rank-2, got {:?}/{:?}",
+        w1.weight.tensor.shape,
+        w3.weight.tensor.shape
+    );
+    let out_dim = w1.weight.tensor.shape[0];
+    let in_dim = w1.weight.tensor.shape[1];
+    ensure!(
+        w3.weight.tensor.shape == [out_dim, in_dim],
+        "shared W1/W3 shape mismatch: w1={:?}, w3={:?}",
+        w1.weight.tensor.shape,
+        w3.weight.tensor.shape
+    );
+    ensure!(
+        in_dim == input.hidden_dim,
+        "shared W1/W3 input dim mismatch: weight expects {}, got {}",
+        in_dim,
+        input.hidden_dim
+    );
+    let scale_shape = [out_dim.div_ceil(128), in_dim.div_ceil(128)];
+    ensure!(
+        w1.scale.tensor.shape == scale_shape && w3.scale.tensor.shape == scale_shape,
+        "shared W1/W3 scale shape mismatch: expected {:?}, got {:?}/{:?}",
+        scale_shape,
+        w1.scale.tensor.shape,
+        w3.scale.tensor.shape
+    );
+    ensure!(
+        gate_out.hidden_dim == out_dim && up_out.hidden_dim == out_dim,
+        "shared W1/W3 output dim mismatch: gate={}, up={}, expected={}",
+        gate_out.hidden_dim,
+        up_out.hidden_dim,
+        out_dim
+    );
+    ensure!(
+        gate_out.seq_capacity() >= input.seq_len && up_out.seq_capacity() >= input.seq_len,
+        "shared W1/W3 output capacity too small: gate={}, up={}, required={}",
+        gate_out.seq_capacity(),
+        up_out.seq_capacity(),
+        input.seq_len
+    );
+    let act_bytes = input.seq_len * in_dim;
+    let act_scale_bytes = input.seq_len * in_dim.div_ceil(128);
+    ensure!(
+        act_workspace.len() >= act_bytes,
+        "shared W1/W3 act workspace too small: have {}, need {act_bytes}",
+        act_workspace.len()
+    );
+    ensure!(
+        act_scale_workspace.len() >= act_scale_bytes,
+        "shared W1/W3 act scale workspace too small: have {}, need {act_scale_bytes}",
+        act_scale_workspace.len()
+    );
+    gate_out.seq_len = input.seq_len;
+    up_out.seq_len = input.seq_len;
+    {
+        let act_workspace_len = act_workspace.len();
+        let act_scale_workspace_len = act_scale_workspace.len();
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (w1_ptr, _w1_guard) = w1.weight.tensor.data.device_ptr(&ctx.stream);
+        let (w1_scale_ptr, _w1_scale_guard) = w1.scale.tensor.data.device_ptr(&ctx.stream);
+        let (w3_ptr, _w3_guard) = w3.weight.tensor.data.device_ptr(&ctx.stream);
+        let (w3_scale_ptr, _w3_scale_guard) = w3.scale.tensor.data.device_ptr(&ctx.stream);
+        let (gate_ptr, _gate_guard) = gate_out.data.device_ptr_mut(&ctx.stream);
+        let (up_ptr, _up_guard) = up_out.data.device_ptr_mut(&ctx.stream);
+        let (act_ptr, _act_guard) = act_workspace.device_ptr_mut(&ctx.stream);
+        let (act_scale_ptr, _act_scale_guard) = act_scale_workspace.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_fp8_w1_w3_with_workspace_cuda(
+                x_ptr as *const ffi::Half,
+                w1_ptr as *const u8,
+                w1_scale_ptr as *const u8,
+                w3_ptr as *const u8,
+                w3_scale_ptr as *const u8,
+                gate_ptr as *mut ffi::Half,
+                up_ptr as *mut ffi::Half,
+                act_ptr as *mut u8,
+                act_workspace_len,
+                act_scale_ptr as *mut u8,
+                act_scale_workspace_len,
+                input.seq_len as i32,
+                in_dim as i32,
+                out_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fp8_w2_swiglu_bf16_hidden_into(
+    ctx: &RankGpuContext,
+    gate: &Bf16HiddenStates,
+    up: &Bf16HiddenStates,
+    limit: f32,
+    w2: &QuantLinearRef<'_>,
+    out: &mut Bf16HiddenStates,
+    act_workspace: &mut CudaSlice<u8>,
+    act_scale_workspace: &mut CudaSlice<u8>,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        w2.weight.tensor.dtype == safetensors::Dtype::F8_E4M3,
+        "shared W2 weight {} must be F8_E4M3, got {:?}",
+        w2.weight.name,
+        w2.weight.tensor.dtype
+    );
+    ensure!(
+        w2.scale.tensor.dtype == safetensors::Dtype::F8_E8M0,
+        "shared W2 scale {} must be F8_E8M0, got {:?}",
+        w2.scale.name,
+        w2.scale.tensor.dtype
+    );
+    ensure!(
+        w2.weight.tensor.shape.len() == 2,
+        "shared W2 weight {} must be rank-2, got {:?}",
+        w2.weight.name,
+        w2.weight.tensor.shape
+    );
+    let out_dim = w2.weight.tensor.shape[0];
+    let in_dim = w2.weight.tensor.shape[1];
+    ensure!(
+        gate.hidden_dim == in_dim && up.hidden_dim == in_dim,
+        "shared W2 SwiGLU input dim mismatch: gate={}, up={}, expected={}",
+        gate.hidden_dim,
+        up.hidden_dim,
+        in_dim
+    );
+    ensure!(
+        gate.seq_len == up.seq_len,
+        "shared W2 SwiGLU seq len mismatch: gate={}, up={}",
+        gate.seq_len,
+        up.seq_len
+    );
+    ensure!(
+        w2.scale.tensor.shape == [out_dim.div_ceil(128), in_dim.div_ceil(128)],
+        "shared W2 scale {} shape mismatch: expected {:?}, got {:?}",
+        w2.scale.name,
+        [out_dim.div_ceil(128), in_dim.div_ceil(128)],
+        w2.scale.tensor.shape
+    );
+    ensure!(
+        out.hidden_dim == out_dim,
+        "shared W2 output dim mismatch: expected {}, got {}",
+        out_dim,
+        out.hidden_dim
+    );
+    ensure!(
+        out.seq_capacity() >= gate.seq_len,
+        "shared W2 output capacity too small: out={}, required={}",
+        out.seq_capacity(),
+        gate.seq_len
+    );
+    let act_bytes = gate.seq_len * in_dim;
+    let act_scale_bytes = gate.seq_len * in_dim.div_ceil(128);
+    ensure!(
+        act_workspace.len() >= act_bytes,
+        "shared W2 act workspace too small: have {}, need {act_bytes}",
+        act_workspace.len()
+    );
+    ensure!(
+        act_scale_workspace.len() >= act_scale_bytes,
+        "shared W2 act scale workspace too small: have {}, need {act_scale_bytes}",
+        act_scale_workspace.len()
+    );
+    out.seq_len = gate.seq_len;
+    {
+        let act_workspace_len = act_workspace.len();
+        let act_scale_workspace_len = act_scale_workspace.len();
+        let (gate_ptr, _gate_guard) = gate.data.device_ptr(&ctx.stream);
+        let (up_ptr, _up_guard) = up.data.device_ptr(&ctx.stream);
+        let (weight_ptr, _weight_guard) = w2.weight.tensor.data.device_ptr(&ctx.stream);
+        let (scale_ptr, _scale_guard) = w2.scale.tensor.data.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        let (act_ptr, _act_guard) = act_workspace.device_ptr_mut(&ctx.stream);
+        let (act_scale_ptr, _act_scale_guard) = act_scale_workspace.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_fp8_w2_swiglu_with_workspace_cuda(
+                gate_ptr as *const ffi::Half,
+                up_ptr as *const ffi::Half,
+                weight_ptr as *const u8,
+                scale_ptr as *const u8,
+                out_ptr as *mut ffi::Half,
+                act_ptr as *mut u8,
+                act_workspace_len,
+                act_scale_ptr as *mut u8,
+                act_scale_workspace_len,
+                gate.seq_len as i32,
+                in_dim as i32,
+                out_dim as i32,
+                limit,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
+}
+
 pub fn fp4_linear_bf16_hidden(
     ctx: &RankGpuContext,
     input: &Bf16HiddenStates,
@@ -1726,16 +1953,26 @@ pub(crate) fn shared_expert_forward_bf16_hidden_scratch<'a>(
         input.seq_len,
         scratch.seq_capacity
     );
-    fp8_linear_bf16_hidden_into(ctx, input, &ffn.shared_w1, &mut scratch.gate)?;
-    fp8_linear_bf16_hidden_into(ctx, input, &ffn.shared_w3, &mut scratch.up)?;
-    swiglu_clamp_bf16_hidden_into(
+    fp8_w1_w3_bf16_hidden_into(
+        ctx,
+        input,
+        &ffn.shared_w1,
+        &ffn.shared_w3,
+        &mut scratch.gate,
+        &mut scratch.up,
+        &mut scratch.fp8_act_workspace,
+        &mut scratch.fp8_act_scale_workspace,
+    )?;
+    fp8_w2_swiglu_bf16_hidden_into(
         ctx,
         &scratch.gate,
         &scratch.up,
         swiglu_limit,
-        &mut scratch.activated,
+        &ffn.shared_w2,
+        &mut scratch.out,
+        &mut scratch.fp8_act_workspace,
+        &mut scratch.fp8_act_scale_workspace,
     )?;
-    fp8_linear_bf16_hidden_into(ctx, &scratch.activated, &ffn.shared_w2, &mut scratch.out)?;
     Ok(&scratch.out)
 }
 

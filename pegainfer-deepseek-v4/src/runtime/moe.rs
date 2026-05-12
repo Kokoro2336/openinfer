@@ -923,7 +923,6 @@ pub(crate) fn local_experts_forward_packed_bf16_hidden_scratch<'a>(
     plan: &MoeFusedRoutePlanView<'_>,
     gate: &mut Bf16HiddenStates,
     up: &mut Bf16HiddenStates,
-    activated: &mut Bf16HiddenStates,
     out: &'a mut Bf16HiddenStates,
     fp4_act_workspace: &mut CudaSlice<u8>,
     fp4_act_scale_workspace: &mut CudaSlice<u8>,
@@ -953,10 +952,11 @@ pub(crate) fn local_experts_forward_packed_bf16_hidden_scratch<'a>(
         fp4_act_workspace,
         fp4_act_scale_workspace,
     )?;
-    swiglu_clamp_bf16_hidden_into(ctx, gate, up, config.swiglu_limit, activated)?;
-    fp4_grouped_linear_bf16_hidden_into(
+    fp4_grouped_w2_swiglu_bf16_hidden_into(
         ctx,
-        activated,
+        gate,
+        up,
+        config.swiglu_limit,
         plan.expert_indptr,
         plan.local_experts,
         &ptrs.w2,
@@ -965,6 +965,119 @@ pub(crate) fn local_experts_forward_packed_bf16_hidden_scratch<'a>(
         fp4_act_scale_workspace,
     )?;
     Ok(out)
+}
+
+fn fp4_grouped_w2_swiglu_bf16_hidden_into(
+    ctx: &RankGpuContext,
+    gate: &Bf16HiddenStates,
+    up: &Bf16HiddenStates,
+    limit: f32,
+    expert_indptr: &CudaSlice<i32>,
+    local_experts: usize,
+    ptrs: &MoeGroupedLinearPtrs,
+    out: &mut Bf16HiddenStates,
+    act_workspace: &mut CudaSlice<u8>,
+    act_scale_workspace: &mut CudaSlice<u8>,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(
+        local_experts > 0,
+        "grouped FP4 W2 SwiGLU needs local experts"
+    );
+    ensure!(
+        expert_indptr.len() > local_experts,
+        "grouped FP4 W2 SwiGLU expert_indptr too small: len={}, local_experts={local_experts}",
+        expert_indptr.len()
+    );
+    ensure!(
+        gate.hidden_dim == up.hidden_dim,
+        "grouped FP4 W2 SwiGLU hidden dim mismatch: gate={}, up={}",
+        gate.hidden_dim,
+        up.hidden_dim
+    );
+    ensure!(
+        gate.seq_len == up.seq_len,
+        "grouped FP4 W2 SwiGLU seq len mismatch: gate={}, up={}",
+        gate.seq_len,
+        up.seq_len
+    );
+    ensure!(
+        ptrs.weight_ptrs.len() == local_experts,
+        "grouped FP4 W2 SwiGLU weight pointer count mismatch: ptrs={}, local_experts={}",
+        ptrs.weight_ptrs.len(),
+        local_experts
+    );
+    ensure!(
+        ptrs.scale_ptrs.len() == local_experts,
+        "grouped FP4 W2 SwiGLU scale pointer count mismatch: ptrs={}, local_experts={}",
+        ptrs.scale_ptrs.len(),
+        local_experts
+    );
+    ensure!(
+        gate.hidden_dim == ptrs.in_dim,
+        "grouped FP4 W2 SwiGLU input dim mismatch: expected {}, got {}",
+        ptrs.in_dim,
+        gate.hidden_dim
+    );
+    ensure!(
+        out.hidden_dim == ptrs.out_dim,
+        "grouped FP4 W2 SwiGLU output dim mismatch: out={}, expected={}",
+        out.hidden_dim,
+        ptrs.out_dim
+    );
+    ensure!(
+        out.seq_capacity() >= gate.seq_len,
+        "grouped FP4 W2 SwiGLU output capacity too small: out={}, required={}",
+        out.seq_capacity(),
+        gate.seq_len
+    );
+    let act_bytes = gate.seq_len * gate.hidden_dim;
+    let act_scale_bytes = gate.seq_len * gate.hidden_dim.div_ceil(128);
+    ensure!(
+        act_workspace.len() >= act_bytes,
+        "grouped FP4 W2 SwiGLU act workspace too small: have {}, need {act_bytes}",
+        act_workspace.len()
+    );
+    ensure!(
+        act_scale_workspace.len() >= act_scale_bytes,
+        "grouped FP4 W2 SwiGLU act scale workspace too small: have {}, need {act_scale_bytes}",
+        act_scale_workspace.len()
+    );
+    out.seq_len = gate.seq_len;
+    {
+        let act_workspace_len = act_workspace.len();
+        let act_scale_workspace_len = act_scale_workspace.len();
+        let (gate_ptr, _gate_guard) = gate.data.device_ptr(&ctx.stream);
+        let (up_ptr, _up_guard) = up.data.device_ptr(&ctx.stream);
+        let (weights_ptr, _weights_guard) = ptrs.weight_ptrs.device_ptr(&ctx.stream);
+        let (scales_ptr, _scales_guard) = ptrs.scale_ptrs.device_ptr(&ctx.stream);
+        let (expert_ptr, _expert_guard) = expert_indptr.device_ptr(&ctx.stream);
+        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+        let (act_ptr, _act_guard) = act_workspace.device_ptr_mut(&ctx.stream);
+        let (act_scale_ptr, _act_scale_guard) = act_scale_workspace.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_moe_fp4_grouped_w2_swiglu_with_workspace_cuda(
+                gate_ptr as *const ffi::Half,
+                up_ptr as *const ffi::Half,
+                weights_ptr as *const *const u8,
+                scales_ptr as *const *const u8,
+                expert_ptr as *const i32,
+                out_ptr as *mut ffi::Half,
+                act_ptr as *mut u8,
+                act_workspace_len,
+                act_scale_ptr as *mut u8,
+                act_scale_workspace_len,
+                gate.seq_len as i32,
+                gate.hidden_dim as i32,
+                ptrs.out_dim as i32,
+                local_experts as i32,
+                limit,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
 }
 
 fn fp4_grouped_w1_w3_bf16_hidden_into(
@@ -1132,99 +1245,6 @@ fn fp4_grouped_linear_bf16_hidden(
         result.result()?;
     }
     Ok(out)
-}
-
-fn fp4_grouped_linear_bf16_hidden_into(
-    ctx: &RankGpuContext,
-    input: &Bf16HiddenStates,
-    expert_indptr: &CudaSlice<i32>,
-    local_experts: usize,
-    ptrs: &MoeGroupedLinearPtrs,
-    out: &mut Bf16HiddenStates,
-    act_workspace: &mut CudaSlice<u8>,
-    act_scale_workspace: &mut CudaSlice<u8>,
-) -> Result<()> {
-    ctx.set_current()?;
-    ensure!(local_experts > 0, "grouped FP4 needs local experts");
-    ensure!(
-        expert_indptr.len() > local_experts,
-        "grouped FP4 expert_indptr too small: len={}, local_experts={local_experts}",
-        expert_indptr.len()
-    );
-    ensure!(
-        ptrs.weight_ptrs.len() == local_experts,
-        "grouped FP4 weight pointer count mismatch: ptrs={}, local_experts={}",
-        ptrs.weight_ptrs.len(),
-        local_experts
-    );
-    ensure!(
-        ptrs.scale_ptrs.len() == local_experts,
-        "grouped FP4 scale pointer count mismatch: ptrs={}, local_experts={}",
-        ptrs.scale_ptrs.len(),
-        local_experts
-    );
-    ensure!(
-        input.hidden_dim == ptrs.in_dim,
-        "grouped FP4 input dim mismatch: expected {}, got {}",
-        ptrs.in_dim,
-        input.hidden_dim
-    );
-    ensure!(
-        out.hidden_dim == ptrs.out_dim,
-        "grouped FP4 output dim mismatch: out={}, expected={}",
-        out.hidden_dim,
-        ptrs.out_dim
-    );
-    ensure!(
-        out.seq_capacity() >= input.seq_len,
-        "grouped FP4 output capacity too small: out={}, required={}",
-        out.seq_capacity(),
-        input.seq_len
-    );
-    let act_bytes = input.seq_len * input.hidden_dim;
-    let act_scale_bytes = input.seq_len * input.hidden_dim.div_ceil(128);
-    ensure!(
-        act_workspace.len() >= act_bytes,
-        "grouped FP4 act workspace too small: have {}, need {act_bytes}",
-        act_workspace.len()
-    );
-    ensure!(
-        act_scale_workspace.len() >= act_scale_bytes,
-        "grouped FP4 act scale workspace too small: have {}, need {act_scale_bytes}",
-        act_scale_workspace.len()
-    );
-    out.seq_len = input.seq_len;
-    {
-        let act_workspace_len = act_workspace.len();
-        let act_scale_workspace_len = act_scale_workspace.len();
-        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
-        let (weights_ptr, _weights_guard) = ptrs.weight_ptrs.device_ptr(&ctx.stream);
-        let (scales_ptr, _scales_guard) = ptrs.scale_ptrs.device_ptr(&ctx.stream);
-        let (expert_ptr, _expert_guard) = expert_indptr.device_ptr(&ctx.stream);
-        let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
-        let (act_ptr, _act_guard) = act_workspace.device_ptr_mut(&ctx.stream);
-        let (act_scale_ptr, _act_scale_guard) = act_scale_workspace.device_ptr_mut(&ctx.stream);
-        let result = unsafe {
-            ffi::deepseek_moe_fp4_grouped_linear_with_workspace_cuda(
-                x_ptr as *const ffi::Half,
-                weights_ptr as *const *const u8,
-                scales_ptr as *const *const u8,
-                expert_ptr as *const i32,
-                out_ptr as *mut ffi::Half,
-                act_ptr as *mut u8,
-                act_workspace_len,
-                act_scale_ptr as *mut u8,
-                act_scale_workspace_len,
-                input.seq_len as i32,
-                input.hidden_dim as i32,
-                ptrs.out_dim as i32,
-                local_experts as i32,
-                ctx.stream.cu_stream(),
-            )
-        };
-        result.result()?;
-    }
-    Ok(())
 }
 
 pub fn hash_routed_moe_rank_local_bf16_hidden(
@@ -1402,7 +1422,6 @@ pub(crate) fn decode_moe_ag_rs_bf16_hidden_with_scratch<'a>(
         &plan,
         &mut moe_scratch.expert_gate,
         &mut moe_scratch.expert_up,
-        &mut moe_scratch.expert_activated,
         &mut moe_scratch.expert_out,
         &mut moe_scratch.fp4_act_workspace,
         &mut moe_scratch.fp4_act_scale_workspace,

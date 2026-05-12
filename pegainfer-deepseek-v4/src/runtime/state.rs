@@ -110,7 +110,6 @@ pub(crate) struct MoeAgRsScratch {
     pub(crate) expanded_input: Bf16HiddenStates,
     pub(crate) expert_gate: Bf16HiddenStates,
     pub(crate) expert_up: Bf16HiddenStates,
-    pub(crate) expert_activated: Bf16HiddenStates,
     pub(crate) expert_out: Bf16HiddenStates,
     pub(crate) fp4_act_workspace: CudaSlice<u8>,
     pub(crate) fp4_act_scale_workspace: CudaSlice<u8>,
@@ -122,8 +121,9 @@ pub(crate) struct MoeAgRsScratch {
 pub(crate) struct SharedExpertScratch {
     pub(crate) gate: Bf16HiddenStates,
     pub(crate) up: Bf16HiddenStates,
-    pub(crate) activated: Bf16HiddenStates,
     pub(crate) out: Bf16HiddenStates,
+    pub(crate) fp8_act_workspace: CudaSlice<u8>,
+    pub(crate) fp8_act_scale_workspace: CudaSlice<u8>,
     pub(crate) seq_capacity: usize,
 }
 
@@ -443,7 +443,6 @@ impl MoeAgRsScratch {
         let expanded_input = Bf16HiddenStates::uninit(ctx, config.dim, route_capacity)?;
         let expert_gate = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, route_capacity)?;
         let expert_up = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, route_capacity)?;
-        let expert_activated = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, route_capacity)?;
         let expert_out = Bf16HiddenStates::uninit(ctx, config.dim, route_capacity)?;
         let max_fp4_input_dim = config.dim.max(config.moe_inter_dim);
         let max_fp4_scale_cols = max_fp4_input_dim.div_ceil(128);
@@ -475,7 +474,6 @@ impl MoeAgRsScratch {
             expanded_input,
             expert_gate,
             expert_up,
-            expert_activated,
             expert_out,
             fp4_act_workspace,
             fp4_act_scale_workspace,
@@ -495,13 +493,18 @@ impl SharedExpertScratch {
         );
         let gate = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, seq_capacity)?;
         let up = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, seq_capacity)?;
-        let activated = Bf16HiddenStates::uninit(ctx, config.moe_inter_dim, seq_capacity)?;
         let out = Bf16HiddenStates::uninit(ctx, config.dim, seq_capacity)?;
+        let max_fp8_input_dim = config.dim.max(config.moe_inter_dim);
+        let max_fp8_scale_cols = max_fp8_input_dim.div_ceil(128);
+        let fp8_act_workspace = unsafe { ctx.stream.alloc(seq_capacity * max_fp8_input_dim)? };
+        let fp8_act_scale_workspace =
+            unsafe { ctx.stream.alloc(seq_capacity * max_fp8_scale_cols)? };
         Ok(Self {
             gate,
             up,
-            activated,
             out,
+            fp8_act_workspace,
+            fp8_act_scale_workspace,
             seq_capacity,
         })
     }
