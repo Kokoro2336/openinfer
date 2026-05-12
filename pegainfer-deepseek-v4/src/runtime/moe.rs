@@ -941,22 +941,14 @@ pub(crate) fn local_experts_forward_packed_bf16_hidden_scratch<'a>(
         plan.local_experts
     );
     let ptrs = &ptr_cache.layers[layer];
-    fp4_grouped_linear_bf16_hidden_into(
+    fp4_grouped_w1_w3_bf16_hidden_into(
         ctx,
         expanded_input,
         plan.expert_indptr,
         plan.local_experts,
         &ptrs.w1,
-        gate,
-        fp4_act_workspace,
-        fp4_act_scale_workspace,
-    )?;
-    fp4_grouped_linear_bf16_hidden_into(
-        ctx,
-        expanded_input,
-        plan.expert_indptr,
-        plan.local_experts,
         &ptrs.w3,
+        gate,
         up,
         fp4_act_workspace,
         fp4_act_scale_workspace,
@@ -973,6 +965,120 @@ pub(crate) fn local_experts_forward_packed_bf16_hidden_scratch<'a>(
         fp4_act_scale_workspace,
     )?;
     Ok(out)
+}
+
+fn fp4_grouped_w1_w3_bf16_hidden_into(
+    ctx: &RankGpuContext,
+    input: &Bf16HiddenStates,
+    expert_indptr: &CudaSlice<i32>,
+    local_experts: usize,
+    w1_ptrs: &MoeGroupedLinearPtrs,
+    w3_ptrs: &MoeGroupedLinearPtrs,
+    gate_out: &mut Bf16HiddenStates,
+    up_out: &mut Bf16HiddenStates,
+    act_workspace: &mut CudaSlice<u8>,
+    act_scale_workspace: &mut CudaSlice<u8>,
+) -> Result<()> {
+    ctx.set_current()?;
+    ensure!(local_experts > 0, "grouped FP4 W1/W3 needs local experts");
+    ensure!(
+        expert_indptr.len() > local_experts,
+        "grouped FP4 W1/W3 expert_indptr too small: len={}, local_experts={local_experts}",
+        expert_indptr.len()
+    );
+    ensure!(
+        w1_ptrs.in_dim == w3_ptrs.in_dim && w1_ptrs.out_dim == w3_ptrs.out_dim,
+        "grouped FP4 W1/W3 shape mismatch: w1=({}->{}) w3=({}->{})",
+        w1_ptrs.in_dim,
+        w1_ptrs.out_dim,
+        w3_ptrs.in_dim,
+        w3_ptrs.out_dim
+    );
+    ensure!(
+        w1_ptrs.weight_ptrs.len() == local_experts && w3_ptrs.weight_ptrs.len() == local_experts,
+        "grouped FP4 W1/W3 weight pointer count mismatch: w1={}, w3={}, local_experts={}",
+        w1_ptrs.weight_ptrs.len(),
+        w3_ptrs.weight_ptrs.len(),
+        local_experts
+    );
+    ensure!(
+        w1_ptrs.scale_ptrs.len() == local_experts && w3_ptrs.scale_ptrs.len() == local_experts,
+        "grouped FP4 W1/W3 scale pointer count mismatch: w1={}, w3={}, local_experts={}",
+        w1_ptrs.scale_ptrs.len(),
+        w3_ptrs.scale_ptrs.len(),
+        local_experts
+    );
+    ensure!(
+        input.hidden_dim == w1_ptrs.in_dim,
+        "grouped FP4 W1/W3 input dim mismatch: expected {}, got {}",
+        w1_ptrs.in_dim,
+        input.hidden_dim
+    );
+    ensure!(
+        gate_out.hidden_dim == w1_ptrs.out_dim && up_out.hidden_dim == w1_ptrs.out_dim,
+        "grouped FP4 W1/W3 output dim mismatch: gate={}, up={}, expected={}",
+        gate_out.hidden_dim,
+        up_out.hidden_dim,
+        w1_ptrs.out_dim
+    );
+    ensure!(
+        gate_out.seq_capacity() >= input.seq_len && up_out.seq_capacity() >= input.seq_len,
+        "grouped FP4 W1/W3 output capacity too small: gate={}, up={}, required={}",
+        gate_out.seq_capacity(),
+        up_out.seq_capacity(),
+        input.seq_len
+    );
+    let act_bytes = input.seq_len * input.hidden_dim;
+    let act_scale_bytes = input.seq_len * input.hidden_dim.div_ceil(128);
+    ensure!(
+        act_workspace.len() >= act_bytes,
+        "grouped FP4 W1/W3 act workspace too small: have {}, need {act_bytes}",
+        act_workspace.len()
+    );
+    ensure!(
+        act_scale_workspace.len() >= act_scale_bytes,
+        "grouped FP4 W1/W3 act scale workspace too small: have {}, need {act_scale_bytes}",
+        act_scale_workspace.len()
+    );
+    gate_out.seq_len = input.seq_len;
+    up_out.seq_len = input.seq_len;
+    {
+        let act_workspace_len = act_workspace.len();
+        let act_scale_workspace_len = act_scale_workspace.len();
+        let (x_ptr, _x_guard) = input.data.device_ptr(&ctx.stream);
+        let (w1_weights_ptr, _w1_weights_guard) = w1_ptrs.weight_ptrs.device_ptr(&ctx.stream);
+        let (w1_scales_ptr, _w1_scales_guard) = w1_ptrs.scale_ptrs.device_ptr(&ctx.stream);
+        let (w3_weights_ptr, _w3_weights_guard) = w3_ptrs.weight_ptrs.device_ptr(&ctx.stream);
+        let (w3_scales_ptr, _w3_scales_guard) = w3_ptrs.scale_ptrs.device_ptr(&ctx.stream);
+        let (expert_ptr, _expert_guard) = expert_indptr.device_ptr(&ctx.stream);
+        let (gate_ptr, _gate_guard) = gate_out.data.device_ptr_mut(&ctx.stream);
+        let (up_ptr, _up_guard) = up_out.data.device_ptr_mut(&ctx.stream);
+        let (act_ptr, _act_guard) = act_workspace.device_ptr_mut(&ctx.stream);
+        let (act_scale_ptr, _act_scale_guard) = act_scale_workspace.device_ptr_mut(&ctx.stream);
+        let result = unsafe {
+            ffi::deepseek_moe_fp4_grouped_w1_w3_with_workspace_cuda(
+                x_ptr as *const ffi::Half,
+                w1_weights_ptr as *const *const u8,
+                w1_scales_ptr as *const *const u8,
+                w3_weights_ptr as *const *const u8,
+                w3_scales_ptr as *const *const u8,
+                expert_ptr as *const i32,
+                gate_ptr as *mut ffi::Half,
+                up_ptr as *mut ffi::Half,
+                act_ptr as *mut u8,
+                act_workspace_len,
+                act_scale_ptr as *mut u8,
+                act_scale_workspace_len,
+                input.seq_len as i32,
+                input.hidden_dim as i32,
+                w1_ptrs.out_dim as i32,
+                local_experts as i32,
+                ctx.stream.cu_stream(),
+            )
+        };
+        result.result()?;
+    }
+    Ok(())
 }
 
 fn fp4_grouped_linear_bf16_hidden(

@@ -277,6 +277,26 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_moe_fp4_grouped_w1_w3_with_workspace_cuda(
+        x: *const Half,
+        w1_weights: *const *const u8,
+        w1_scales: *const *const u8,
+        w3_weights: *const *const u8,
+        w3_scales: *const *const u8,
+        expert_indptr: *const i32,
+        gate_out: *mut Half,
+        up_out: *mut Half,
+        act: *mut u8,
+        act_bytes: usize,
+        act_scale: *mut u8,
+        act_scale_bytes: usize,
+        rows: i32,
+        in_dim: i32,
+        out_dim: i32,
+        local_experts: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_swiglu_clamp_cuda(
         gate: *const Half,
         up: *const Half,

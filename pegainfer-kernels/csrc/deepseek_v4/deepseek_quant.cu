@@ -372,6 +372,20 @@ extern "C" int deepseek_tilelang_fp4_grouped_gemm_n2048_k4096(
     int local_experts,
     cudaStream_t stream);
 
+extern "C" int deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096(
+    const void* a,
+    const void* const* w1,
+    const void* const* w3,
+    void* gate_out,
+    void* up_out,
+    const void* scales_a,
+    const void* const* scales_w1,
+    const void* const* scales_w3,
+    const int* expert_indptr,
+    int m,
+    int local_experts,
+    cudaStream_t stream);
+
 extern "C" int deepseek_tilelang_fp4_grouped_gemm_n4096_k2048(
     const void* a,
     const void* const* b,
@@ -488,6 +502,70 @@ static cudaError_t deepseek_moe_fp4_grouped_linear_workspace_cuda(
       out,
       act_scale,
       reinterpret_cast<const void* const*>(scales),
+      expert_indptr,
+      rows,
+      local_experts,
+      stream));
+  return err == cudaSuccess ? cudaGetLastError() : err;
+}
+
+static cudaError_t deepseek_moe_fp4_grouped_w1_w3_workspace_cuda(
+    const __nv_bfloat16 *x,
+    const unsigned char *const *w1_weights,
+    const unsigned char *const *w1_scales,
+    const unsigned char *const *w3_weights,
+    const unsigned char *const *w3_scales,
+    const int *expert_indptr,
+    __nv_bfloat16 *gate_out,
+    __nv_bfloat16 *up_out,
+    unsigned char *act,
+    size_t act_bytes,
+    unsigned char *act_scale,
+    size_t act_scale_bytes,
+    int rows,
+    int in_dim,
+    int out_dim,
+    int local_experts,
+    cudaStream_t stream) {
+  if (rows < 0 || in_dim <= 0 || out_dim <= 0 || local_experts <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (rows == 0) return cudaSuccess;
+  if (x == nullptr || w1_weights == nullptr || w1_scales == nullptr ||
+      w3_weights == nullptr || w3_scales == nullptr || expert_indptr == nullptr ||
+      gate_out == nullptr || up_out == nullptr || act == nullptr || act_scale == nullptr) {
+    return cudaErrorInvalidDevicePointer;
+  }
+
+  DeepseekTilelangActQuantFn act_fn = nullptr;
+  DeepseekTilelangGroupedFp4GemmFn gemm_fn = nullptr;
+  if (!deepseek_tilelang_grouped_fp4_linear_fns(in_dim, out_dim, &act_fn, &gemm_fn)) {
+    return cudaErrorNotSupported;
+  }
+  if (in_dim != 4096 || out_dim != 2048) {
+    return cudaErrorNotSupported;
+  }
+
+  const int scale_cols = (in_dim + 127) / 128;
+  const size_t required_act_bytes = (size_t)rows * (size_t)in_dim;
+  const size_t required_act_scale_bytes = (size_t)rows * (size_t)scale_cols;
+  if (act_bytes < required_act_bytes || act_scale_bytes < required_act_scale_bytes) {
+    return cudaErrorInvalidValue;
+  }
+
+  cudaError_t err = static_cast<cudaError_t>(
+      act_fn(x, act, act_scale, rows, stream));
+  if (err != cudaSuccess) return err;
+
+  err = static_cast<cudaError_t>(deepseek_tilelang_fp4_grouped_w13_gemm_n2048_k4096(
+      act,
+      reinterpret_cast<const void* const*>(w1_weights),
+      reinterpret_cast<const void* const*>(w3_weights),
+      gate_out,
+      up_out,
+      act_scale,
+      reinterpret_cast<const void* const*>(w1_scales),
+      reinterpret_cast<const void* const*>(w3_scales),
       expert_indptr,
       rows,
       local_experts,
@@ -922,6 +1000,30 @@ cudaError_t deepseek_moe_fp4_grouped_linear_with_workspace_cuda(
   return deepseek_moe_fp4_grouped_linear_workspace_cuda(
       x, weights, scales, expert_indptr, out,
       act, act_bytes, act_scale, act_scale_bytes,
+      rows, in_dim, out_dim, local_experts, stream);
+}
+
+cudaError_t deepseek_moe_fp4_grouped_w1_w3_with_workspace_cuda(
+    const __nv_bfloat16 *x,
+    const unsigned char *const *w1_weights,
+    const unsigned char *const *w1_scales,
+    const unsigned char *const *w3_weights,
+    const unsigned char *const *w3_scales,
+    const int *expert_indptr,
+    __nv_bfloat16 *gate_out,
+    __nv_bfloat16 *up_out,
+    unsigned char *act,
+    size_t act_bytes,
+    unsigned char *act_scale,
+    size_t act_scale_bytes,
+    int rows,
+    int in_dim,
+    int out_dim,
+    int local_experts,
+    cudaStream_t stream) {
+  return deepseek_moe_fp4_grouped_w1_w3_workspace_cuda(
+      x, w1_weights, w1_scales, w3_weights, w3_scales, expert_indptr,
+      gate_out, up_out, act, act_bytes, act_scale, act_scale_bytes,
       rows, in_dim, out_dim, local_experts, stream);
 }
 
