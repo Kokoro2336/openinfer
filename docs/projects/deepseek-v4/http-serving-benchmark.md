@@ -239,6 +239,74 @@ Rank-0 profile shows the clearest long-prompt improvement in the ratio-4 bucket:
 Profile-mode TTFT is still a synchronized diagnostic measurement, not a serving
 number. The serving-number evidence remains the non-profile HTTP sweep above.
 
+### P3 CuTeDSL Indexer-Score Runtime Observation
+
+After the CuTeDSL exact indexer-score path passed diagnostic equivalence, the
+next observation compares the default serial score path against the explicit
+experimental runtime feature:
+
+- default serial: `--features deepseek-v4`;
+- experimental: `--features deepseek-v4-cutedsl-indexer-score`.
+
+Both runs used the same head, model, and workload:
+
+| Field | Value |
+| --- | --- |
+| Commit | `bf9e7d9` |
+| Model | `/data/DeepSeek-V4-Flash` |
+| HTTP workload | prompt words `8192` (`10580` tokens), `max_tokens=1`, concurrency `1`, measured request `1`, warmup `0`, timeout `900s` |
+| Direct workload | `bench_serving request --prompt-len 10580 --output-len 1 --warmup 0 --iters 1 --seed 42` under `nsys profile` |
+
+Correctness stayed on the same hash gate:
+
+| Gate | Default serial | Experimental CuTeDSL score |
+| --- | --- | --- |
+| 10k HTTP output hash | `eea187c414579fd7` | `eea187c414579fd7` |
+| 10k direct generated-token hash | `39a863e299d2b187` | `39a863e299d2b187` |
+| c1/c2/c4/c8 HTTP sweep | existing main gate | `failed=0`, `timeout=0`, per-request hashes stable across 3 repeats; combined hash `22706877075acde0` |
+
+The first HTTP profile request after server start is kept separate from warm
+repeats:
+
+| Mode | Run | TTFT ms | Prefill ms | `block_prefill` ms | ratio-4 `block_prefill` ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| serial | first | `9489.99` | `9471.88` | `9006.45` | `6730.78` |
+| CuTeDSL score | first | `9562.18` | `9544.12` | `9082.79` | `6813.58` |
+| serial | warm repeat 1 | `9505.90` | `9488.77` | `9035.94` | `6762.69` |
+| serial | warm repeat 2 | `8761.66` | `8757.71` | `8733.20` | `6740.94` |
+| serial | warm repeat 3 | `8753.81` | `8750.20` | `8729.85` | `6739.70` |
+| CuTeDSL score | warm repeat 1 | `8379.36` | `8361.01` | `7953.76` | `5677.60` |
+| CuTeDSL score | warm repeat 2 | `7872.12` | `7868.20` | `7843.73` | `5676.17` |
+| CuTeDSL score | warm repeat 3 | `7695.51` | `7691.90` | `7672.28` | `5679.06` |
+
+The stable warm repeats show the experimental path reducing the ratio-4
+profile bucket by roughly `1.06s` on this workload. The bucket is still coarse:
+it covers the whole ratio-4 block, not only indexer-score execution.
+
+`nsys` kernel summaries explain which part moved. Times below are summed kernel
+durations across captured GPU launches, so they are attribution data rather
+than end-to-end serving latency.
+
+| Kernel family | Serial total ms / calls | CuTeDSL total ms / calls | Observation |
+| --- | ---: | ---: | --- |
+| overlap compressor | `20785.98 / 504` | `20789.04 / 504` | unchanged |
+| indexer top-k | `12971.09 / 168` | `12975.70 / 168` | unchanged; now the largest remaining indexer-side bucket |
+| indexer score | `10394.65 / 168` | `1815.79 / 168` | CuTeDSL exact score removes most score-kernel time |
+| NCCL all-reduce | `7698.93 / 864` | `7590.09 / 864` | unchanged within noise |
+| non-overlap compressor | `7145.96 / 160` | `7150.87 / 160` | unchanged |
+| indexed attention | `731.49 / 344` | `731.38 / 344` | unchanged |
+
+Direct `bench_serving` under `nsys` moved from `9126.05ms` TTFT on the default
+serial path to `8036.03ms` with the experimental feature. This is consistent
+with the HTTP warm-repeat direction, but it is an observation for this explicit
+feature only. It does not change the default `deepseek-v4` feature, and it is
+not a production throughput conclusion.
+
+The next likely target is no longer the indexer-score kernel itself. After this
+feature, the dominant captured prefill families are overlap compressor and
+indexer top-k, while indexed attention is comparatively small in this 10k
+profile.
+
 ## Boundary
 
 This PR establishes a benchmark gate and one real HTTP run. It does not claim
