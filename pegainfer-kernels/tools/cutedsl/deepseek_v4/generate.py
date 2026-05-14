@@ -7,8 +7,9 @@ The first production CuTe DSL target is the indexer score dot product:
         dot(q[token, head, :], kv[compressed, :])
 
 The original CUDA entry points keep their C ABI and run the small ReLU/weight
-epilogue in CUDA. This generator only exports the BF16 TensorCore GEMM used for
-the dot stage.
+epilogue in CUDA. This generator exports the TensorCore GEMM used for the dot
+stage and keeps the dot output in FP32 so the following top-k path sees the same
+precision class as the retired serial indexer-score kernel.
 """
 
 from __future__ import annotations
@@ -25,17 +26,26 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 
 
 def load_sm120_gemm_class(cutlass_root: Path):
-    gemm_path = (
-        cutlass_root
-        / "examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py"
-    )
-    if not gemm_path.exists():
-        raise FileNotFoundError(f"SM120 CuTe DSL dense_gemm.py not found: {gemm_path}")
+    gemm_path = find_sm120_dense_gemm_path(cutlass_root)
     spec = importlib.util.spec_from_file_location("pegainfer_cutedsl_sm120_dense_gemm", gemm_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module.Sm120GemmKernel
+
+
+def find_sm120_dense_gemm_path(cutlass_root: Path) -> Path:
+    candidates = [
+        cutlass_root
+        / "examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py",
+        cutlass_root / "examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py",
+    ]
+    for gemm_path in candidates:
+        if gemm_path.exists():
+            return gemm_path
+    gemm_path = candidates[0]
+    if not gemm_path.exists():
+        raise FileNotFoundError(f"SM120 CuTe DSL dense_gemm.py not found: {gemm_path}")
 
 
 def find_cutlass_root(repo_root: Path, explicit: str | None) -> Path:
@@ -51,10 +61,14 @@ def find_cutlass_root(repo_root: Path, explicit: str | None) -> Path:
     )
     for candidate in candidates:
         candidate = candidate.resolve()
-        if (
-            candidate
-            / "examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py"
-        ).exists():
+        if any(
+            path.exists()
+            for path in (
+                candidate
+                / "examples/python/CuTeDSL/cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py",
+                candidate / "examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py",
+            )
+        ):
             return candidate
     raise FileNotFoundError(
         "Could not find CUTLASS CuTe DSL examples. Set PEGAINFER_CUTEDSL_CUTLASS_ROOT."
@@ -74,11 +88,40 @@ def write_wrapper(out_dir: Path) -> Path:
 
 namespace {
 
+constexpr int kMaxIndexerDotsWarmupShapes = 64;
+
+struct IndexerDotsWarmupShape {
+  int rows = 0;
+  int compressed_len = 0;
+  bool initialized = false;
+};
+
 idx_gemm_Kernel_Module_t g_indexer_dots_module;
 std::once_flag g_indexer_dots_once;
+std::mutex g_indexer_dots_launch_mutex;
+IndexerDotsWarmupShape g_indexer_dots_warmup_shapes[kMaxIndexerDotsWarmupShapes];
 
 void load_indexer_dots_module_once() {
   idx_gemm_Kernel_Module_Load(&g_indexer_dots_module);
+}
+
+bool mark_indexer_dots_shape_for_warmup(int rows, int compressed_len) {
+  for (int i = 0; i < kMaxIndexerDotsWarmupShapes; ++i) {
+    IndexerDotsWarmupShape &shape = g_indexer_dots_warmup_shapes[i];
+    if (shape.initialized && shape.rows == rows && shape.compressed_len == compressed_len) {
+      return false;
+    }
+  }
+  for (int i = 0; i < kMaxIndexerDotsWarmupShapes; ++i) {
+    IndexerDotsWarmupShape &shape = g_indexer_dots_warmup_shapes[i];
+    if (!shape.initialized) {
+      shape.rows = rows;
+      shape.compressed_len = compressed_len;
+      shape.initialized = true;
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace
@@ -86,7 +129,7 @@ void load_indexer_dots_module_once() {
 extern "C" cudaError_t deepseek_cutedsl_indexer_dots_bf16_cuda(
     const __nv_bfloat16 *q,
     const __nv_bfloat16 *kv,
-    __nv_bfloat16 *dots,
+    float *dots,
     int rows,
     int compressed_len,
     cudaStream_t stream) {
@@ -113,7 +156,21 @@ extern "C" cudaError_t deepseek_cutedsl_indexer_dots_bf16_cuda(
   c.dynamic_strides[0] = compressed_len;
   c.dynamic_strides[1] = 1;
 
-  int32_t ret = cute_dsl_idx_gemm_wrapper(&g_indexer_dots_module, &a, &b, &c, stream);
+  int32_t ret = 0;
+  {
+    std::lock_guard<std::mutex> guard(g_indexer_dots_launch_mutex);
+    if (mark_indexer_dots_shape_for_warmup(rows, compressed_len)) {
+      ret = cute_dsl_idx_gemm_wrapper(&g_indexer_dots_module, &a, &b, &c, stream);
+      if (ret != 0) {
+        return cudaErrorUnknown;
+      }
+      cudaError_t warmup_error = cudaStreamSynchronize(stream);
+      if (warmup_error != cudaSuccess) {
+        return warmup_error;
+      }
+    }
+    ret = cute_dsl_idx_gemm_wrapper(&g_indexer_dots_module, &a, &b, &c, stream);
+  }
   if (ret != 0) {
     return cudaErrorUnknown;
   }
@@ -152,7 +209,7 @@ def main() -> None:
         stride_order=(1, 0, 2),
     )
     dots = make_fake_compact_tensor(
-        cutlass.BFloat16,
+        cutlass.Float32,
         (rows, compressed_len, 1),
         stride_order=(1, 0, 2),
     )
