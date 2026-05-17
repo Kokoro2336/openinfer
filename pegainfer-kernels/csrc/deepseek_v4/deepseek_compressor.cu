@@ -144,150 +144,6 @@ __global__ void deepseek_apply_rope_hidden_strided_kernel(
       sin_cache[pos * (rotary_dim / 2) + rotary_pair], inverse != 0);
 }
 
-__global__ void deepseek_compressor_nonoverlap_weighted_kernel(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ wkv,
-    const __nv_bfloat16 *__restrict__ wgate,
-    const float *__restrict__ ape,
-    float *__restrict__ weighted,
-    int compressed_len,
-    int hidden_dim,
-    int head_dim,
-    int ratio) {
-  int dim = blockIdx.x;
-  int compressed = blockIdx.y;
-  int tid = threadIdx.x;
-  if (dim >= head_dim || compressed >= compressed_len) return;
-
-  extern __shared__ float scratch[];
-  float *score_scratch = scratch;
-  float *kv_scratch = scratch + blockDim.x;
-  float *scores = scratch + 2 * blockDim.x;
-  float *values = scores + ratio;
-
-  for (int route = 0; route < ratio; ++route) {
-    int token = compressed * ratio + route;
-    float score_partial = 0.0f;
-    float kv_partial = 0.0f;
-    for (int k = tid; k < hidden_dim; k += blockDim.x) {
-      float x_value = __bfloat162float(x[token * hidden_dim + k]);
-      score_partial += x_value * __bfloat162float(wgate[dim * hidden_dim + k]);
-      kv_partial += x_value * __bfloat162float(wkv[dim * hidden_dim + k]);
-    }
-    score_scratch[tid] = score_partial;
-    kv_scratch[tid] = kv_partial;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (tid < stride) {
-        score_scratch[tid] += score_scratch[tid + stride];
-        kv_scratch[tid] += kv_scratch[tid + stride];
-      }
-      __syncthreads();
-    }
-
-    if (tid == 0) {
-      scores[route] = score_scratch[0] + ape[route * head_dim + dim];
-      values[route] = kv_scratch[0];
-    }
-    __syncthreads();
-  }
-
-  if (tid == 0) {
-    float max_score = -3.4028234663852886e38f;
-    for (int route = 0; route < ratio; ++route) {
-      max_score = fmaxf(max_score, scores[route]);
-    }
-    float denom = 0.0f;
-    float acc = 0.0f;
-    for (int route = 0; route < ratio; ++route) {
-      float prob = expf(scores[route] - max_score);
-      denom += prob;
-      acc += prob * values[route];
-    }
-    weighted[compressed * head_dim + dim] = acc / denom;
-  }
-}
-
-__global__ void deepseek_compressor_nonoverlap_weighted_serial_kernel(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ wkv,
-    const __nv_bfloat16 *__restrict__ wgate,
-    const float *__restrict__ ape,
-    float *__restrict__ weighted,
-    int compressed_len,
-    int hidden_dim,
-    int head_dim,
-    int ratio) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = compressed_len * head_dim;
-  if (idx >= total) return;
-
-  int dim = idx % head_dim;
-  int compressed = idx / head_dim;
-  float max_score = -3.4028234663852886e38f;
-  float scores[128];
-  float values[128];
-
-  for (int route = 0; route < ratio; ++route) {
-    int token = compressed * ratio + route;
-    float score_sum = 0.0f;
-    float kv_sum = 0.0f;
-    for (int k = 0; k < hidden_dim; ++k) {
-      float x_value = __bfloat162float(x[token * hidden_dim + k]);
-      score_sum += x_value * __bfloat162float(wgate[dim * hidden_dim + k]);
-      kv_sum += x_value * __bfloat162float(wkv[dim * hidden_dim + k]);
-    }
-    scores[route] = score_sum + ape[route * head_dim + dim];
-    values[route] = kv_sum;
-    max_score = fmaxf(max_score, scores[route]);
-  }
-
-  float denom = 0.0f;
-  float acc = 0.0f;
-  for (int route = 0; route < ratio; ++route) {
-    float prob = expf(scores[route] - max_score);
-    denom += prob;
-    acc += prob * values[route];
-  }
-  weighted[compressed * head_dim + dim] = acc / denom;
-}
-
-__global__ void deepseek_compressor_nonoverlap_norm_kernel(
-    const float *__restrict__ weighted,
-    const __nv_bfloat16 *__restrict__ norm,
-    __nv_bfloat16 *__restrict__ out,
-    int compressed_len,
-    int head_dim,
-    float eps) {
-  int compressed = blockIdx.x;
-  int tid = threadIdx.x;
-  if (compressed >= compressed_len) return;
-
-  extern __shared__ float scratch[];
-  float partial = 0.0f;
-  for (int dim = tid; dim < head_dim; dim += blockDim.x) {
-    float value = weighted[compressed * head_dim + dim];
-    partial += value * value;
-  }
-  scratch[tid] = partial;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      scratch[tid] += scratch[tid + stride];
-    }
-    __syncthreads();
-  }
-
-  float inv_rms = rsqrtf(scratch[0] / head_dim + eps);
-  for (int dim = tid; dim < head_dim; dim += blockDim.x) {
-    float value = weighted[compressed * head_dim + dim] * inv_rms *
-                  __bfloat162float(norm[dim]);
-    out[compressed * head_dim + dim] = __float2bfloat16(value);
-  }
-}
-
 __global__ void deepseek_compressor_norm_serial_kernel(
     const float *__restrict__ weighted,
     const __nv_bfloat16 *__restrict__ norm,
@@ -312,24 +168,110 @@ __global__ void deepseek_compressor_norm_serial_kernel(
   out[compressed * head_dim + dim] = __float2bfloat16(value);
 }
 
-// Fused overlap-compressor prefill epilogue. Consumes per-token (score, value)
-// FP32 tensors produced by two upstream X @ W^T BF16->FP32 cuBLAS GEMMs (gate
-// scores, kv values), and for each compressed row:
-//   1) gathers the 8 ratio-4 overlap routes per (compressed, dim) cell,
+// Fused non-overlap-compressor prefill epilogue. Consumes per-token
+// (score, value) FP32 tensors produced by two upstream X @ W^T BF16->FP32
+// cuBLAS GEMMs (gate scores, kv values), and for each compressed row:
+//   1) streams over the `ratio` non-overlap routes per (compressed, dim) cell
+//      with online softmax (two passes per dim: max, then denom + weighted
+//      sum together) so `ratio` is unbounded,
 //   2) adds the per-route APE bias and runs numerically-stable softmax,
 //   3) writes the FP32 weighted output,
 //   4) reduces the row's sum-of-squares to inv_rms and emits the BF16 RMSNormed
 //      output -- all in one launch, without round-tripping `weighted` through
 //      HBM between softmax and RMSNorm.
 //
-// scores_in / values_in are row-major (seq_len, 2*head_dim) FP32 tensors emitted
+// scores_in / values_in are row-major (seq_len, head_dim) FP32 tensors emitted
 // by cuBLAS via the swap-and-transpose trick used in deepseek_bf16_linear_cuda:
 // cuBLAS sees A=W with OP_T and B=X with OP_N, so its column-major (n, seq_len)
 // result is bit-equal to the row-major (seq_len, n) buffer we read here.
-// sv_n_stride is the M-row stride, equal to 2 * head_dim.
+// sv_n_stride is the M-row stride, equal to head_dim.
 //
 // Launch: 1 block per compressed position, blockDim.x covers head_dim with a
 // strided loop. Block must be a multiple of warpSize and at most 1024 threads.
+__global__ void deepseek_compressor_nonoverlap_fused_epilogue_kernel(
+    const float *__restrict__ scores_in,
+    const float *__restrict__ values_in,
+    const float *__restrict__ ape,
+    const __nv_bfloat16 *__restrict__ norm,
+    float *__restrict__ weighted,
+    __nv_bfloat16 *__restrict__ out,
+    int compressed_len,
+    int head_dim,
+    int ratio,
+    int sv_n_stride,
+    float eps) {
+  int c = blockIdx.x;
+  if (c >= compressed_len) return;
+  int tid = threadIdx.x;
+  int n_block = blockDim.x;
+
+  constexpr float neg_inf = -3.4028234663852886e38f;
+
+  float sum_sq_local = 0.0f;
+
+  // Streaming online softmax + weighted sum so ratio is unbounded (DSV4 uses
+  // ratio up to 128). Two passes over the routes per d:
+  //   1) find max(score) for numerical stability.
+  //   2) accumulate softmax denominator + weighted-value numerator together.
+  // Each thread handles its own d strides; routes are read from L2-cached
+  // FP32 sv_buf so the double read is bandwidth-cheap.
+  for (int d = tid; d < head_dim; d += n_block) {
+    float m = neg_inf;
+    for (int r = 0; r < ratio; ++r) {
+      int token = c * ratio + r;
+      int offset = token * sv_n_stride + d;
+      float s = scores_in[offset] + ape[r * head_dim + d];
+      m = fmaxf(m, s);
+    }
+
+    float denom = 0.0f;
+    float acc = 0.0f;
+    for (int r = 0; r < ratio; ++r) {
+      int token = c * ratio + r;
+      int offset = token * sv_n_stride + d;
+      float s = scores_in[offset] + ape[r * head_dim + d];
+      float v = values_in[offset];
+      float p = __expf(s - m);
+      denom += p;
+      acc += p * v;
+    }
+    float w = acc / denom;
+    weighted[c * head_dim + d] = w;
+    sum_sq_local += w * w;
+  }
+
+  // Block-wide reduction of sum_sq via warp-shfl + smem (mirrors overlap epilogue).
+  __shared__ float warp_sums[32];
+  int lane = tid & 31;
+  int warp = tid >> 5;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    sum_sq_local += __shfl_down_sync(0xffffffffu, sum_sq_local, off);
+  }
+  if (lane == 0) warp_sums[warp] = sum_sq_local;
+  __syncthreads();
+
+  int n_warps = (n_block + 31) >> 5;
+  float total = (tid < n_warps) ? warp_sums[tid] : 0.0f;
+  if (warp == 0) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      total += __shfl_down_sync(0xffffffffu, total, off);
+    }
+  }
+  __shared__ float total_sum;
+  if (tid == 0) total_sum = total;
+  __syncthreads();
+
+  float inv_rms = rsqrtf(total_sum / static_cast<float>(head_dim) + eps);
+
+  for (int d = tid; d < head_dim; d += n_block) {
+    float w = weighted[c * head_dim + d];
+    float ns = __bfloat162float(norm[d]);
+    out[c * head_dim + d] = __float2bfloat16(w * inv_rms * ns);
+  }
+}
+
 __global__ void deepseek_compressor_overlap_fused_epilogue_kernel(
     const float *__restrict__ scores_in,
     const float *__restrict__ values_in,
@@ -768,6 +710,15 @@ cudaError_t deepseek_bf16_linear_cuda(
   return cudaGetLastError();
 }
 
+// Non-overlap prefill compressor: two BF16 x BF16 -> FP32 cuBLAS GEMMs
+// (X @ Wgate^T for scores, X @ Wkv^T for values) into a shared FP32 scratch,
+// then one fused epilogue kernel that gathers the `ratio` routes per
+// compressed token, softmaxes, writes `weighted`, and RMSNorms in place to
+// BF16 `out`. Mirrors the structure of `deepseek_compressor_overlap_prefill_cuda`.
+// Replaces the previous hand-rolled per-(compressed, head_dim) weighted kernel,
+// which redundantly reloaded `Wgate` / `Wkv` for every output element and
+// never reached tensor cores. The single scratch alloc covering both score
+// and value buffers avoids paying `cudaMallocAsync` overhead twice.
 cudaError_t deepseek_compressor_nonoverlap_prefill_cuda(
     const __nv_bfloat16 *x,
     const __nv_bfloat16 *wkv,
@@ -782,21 +733,93 @@ cudaError_t deepseek_compressor_nonoverlap_prefill_cuda(
     int ratio,
     float eps,
     cudaStream_t stream) {
-  if (ratio <= 0 || ratio > 128 || seq_len < ratio) return cudaErrorInvalidValue;
-  int compressed_len = seq_len / ratio;
-  constexpr int threads = 256;
-  dim3 weighted_grid(head_dim, compressed_len);
-  size_t weighted_shared = (2 * threads + 2 * ratio) * sizeof(float);
-  deepseek_compressor_nonoverlap_weighted_kernel<<<weighted_grid, threads, weighted_shared, stream>>>(
-      x, wkv, wgate, ape, weighted, compressed_len, hidden_dim, head_dim, ratio);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) return err;
+  if (x == nullptr || wkv == nullptr || wgate == nullptr || ape == nullptr ||
+      norm == nullptr || weighted == nullptr || out == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  // ratio upper bound 128 matches the pre-cuBLAS hand-rolled host wrapper and
+  // DSV4's actual layer configuration (`config.compress_ratios` reaches 128).
+  // The fused epilogue uses streaming softmax so it has no compile-time route
+  // ceiling.
+  // `seq_len` does NOT need to be a multiple of `ratio`: the GEMMs run over the
+  // full input, the epilogue reads only the first `compressed_len * ratio`
+  // tokens, and any trailing partial group is ignored (matches the pre-cuBLAS
+  // hand-rolled kernel's behavior). Required for online prompts whose prefill
+  // length is not aligned to `ratio` (e.g. ratio=2 with seq_len=21).
+  if (ratio <= 1 || ratio > 128 || seq_len < ratio || hidden_dim <= 0 ||
+      head_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int compressed_len = seq_len / ratio;
 
-  int norm_total = compressed_len * head_dim;
-  int norm_blocks = (norm_total + threads - 1) / threads;
-  deepseek_compressor_norm_serial_kernel<<<norm_blocks, threads, 0, stream>>>(
-      weighted, norm, out, compressed_len, head_dim, eps);
-  return cudaGetLastError();
+  DeepseekCompressorScratch *scratch_ptr = nullptr;
+  cudaError_t cuda_status = deepseek_compressor_scratch_for_device(&scratch_ptr);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  DeepseekCompressorScratch &scratch = *scratch_ptr;
+  std::lock_guard<std::mutex> lock(scratch.mutex);
+  cuda_status = deepseek_ensure_compressor_bf16_linear_handle(scratch);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  cublasStatus_t status = cublasSetStream(scratch.bf16_linear_handle, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
+
+  const size_t sv_elems = static_cast<size_t>(seq_len) * head_dim;
+  float *sv_buf = nullptr;
+  cuda_status = cudaMallocAsync(
+      reinterpret_cast<void **>(&sv_buf), 2 * sv_elems * sizeof(float), stream);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  float *scores_buf = sv_buf;
+  float *values_buf = sv_buf + sv_elems;
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  // Row-major (seq_len, head_dim) via cuBLAS column-major swap-and-transpose:
+  // A = W with OP_T, B = X with OP_N, so column-major output (head_dim, seq_len)
+  // is bit-for-bit the row-major (seq_len, head_dim) view the epilogue reads.
+  // Output dtype is CUDA_R_32F to keep the FP32 tensor-core accumulator -- a
+  // BF16 output here loses precision before softmax.
+  status = cublasGemmEx(
+      scratch.bf16_linear_handle,
+      CUBLAS_OP_T, CUBLAS_OP_N,
+      head_dim, seq_len, hidden_dim,
+      &alpha,
+      wgate, CUDA_R_16BF, hidden_dim,
+      x, CUDA_R_16BF, hidden_dim,
+      &beta,
+      scores_buf, CUDA_R_32F, head_dim,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    cudaFreeAsync(sv_buf, stream);
+    return cudaErrorUnknown;
+  }
+  status = cublasGemmEx(
+      scratch.bf16_linear_handle,
+      CUBLAS_OP_T, CUBLAS_OP_N,
+      head_dim, seq_len, hidden_dim,
+      &alpha,
+      wkv, CUDA_R_16BF, hidden_dim,
+      x, CUDA_R_16BF, hidden_dim,
+      &beta,
+      values_buf, CUDA_R_32F, head_dim,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    cudaFreeAsync(sv_buf, stream);
+    return cudaErrorUnknown;
+  }
+
+  // Epilogue: one block per compressed token; threads collaborate over head_dim
+  // with a block-wide warp-shuffle reduction for the RMS-norm sum_sq.
+  int epilogue_threads = head_dim < 256 ? head_dim : 256;
+  if (epilogue_threads > 1024) epilogue_threads = 1024;
+  epilogue_threads = (epilogue_threads + 31) & ~31;
+  if (epilogue_threads <= 0) epilogue_threads = 32;
+  deepseek_compressor_nonoverlap_fused_epilogue_kernel<<<compressed_len, epilogue_threads, 0, stream>>>(
+      scores_buf, values_buf, ape, norm, weighted, out,
+      compressed_len, head_dim, ratio, /*sv_n_stride=*/head_dim, eps);
+  cuda_status = cudaGetLastError();
+  cudaFreeAsync(sv_buf, stream);
+  return cuda_status;
 }
 
 // Two BF16 x BF16 -> FP32 cuBLAS GEMMs (X @ Wgate^T for scores, X @ Wkv^T for
