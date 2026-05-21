@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
     pegainfer_vllm_frontend::serve_model(
         handle,
         args.model_id,
+        Vec::new(),
         args.port,
         args.max_model_len,
         pegainfer_vllm_frontend::shutdown_token_from_ctrl_c(),

@@ -221,6 +221,7 @@ impl LocalEngineBridge {
 pub async fn serve(
     handle: EngineHandle,
     model_path: &Path,
+    served_model_name: Option<&str>,
     port: u16,
     shutdown: CancellationToken,
 ) -> Result<()> {
@@ -228,6 +229,10 @@ pub async fn serve(
     serve_model(
         handle,
         model_path.to_string_lossy().into_owned(),
+        served_model_name
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect(),
         port,
         max_model_len,
         shutdown,
@@ -238,6 +243,7 @@ pub async fn serve(
 pub async fn serve_model(
     handle: EngineHandle,
     model_id: impl Into<String>,
+    served_model_name: Vec<String>,
     port: u16,
     max_model_len: u32,
     shutdown: CancellationToken,
@@ -269,6 +275,7 @@ pub async fn serve_model(
         },
         coordinator_mode: CoordinatorMode::None,
         model: model_id,
+        served_model_name,
         listener_mode: HttpListenerMode::BindTcp {
             host: "0.0.0.0".to_string(),
             port,
