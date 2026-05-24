@@ -30,6 +30,9 @@ Every kept optimization needs all of these recorded before commit:
 
 | Gate | Requirement |
 | --- | --- |
+| Profile | Start from an observed profile or benchmark delta. Record the command, output path, and the measured bottleneck or symptom. |
+| Motivation / expected gain | State why the change should help and the expected size/direction of the win before implementing it. |
+| Microbench | Add or run the smallest probe that isolates the changed subsystem when practical. If no microbench is practical, record why and use the closest lower-level measurement. |
 | Correctness | Record the exact command, output file, token hash, and comparison target. For TP8/PPLX changes, compare against the TP8 NCCL baseline unless a stronger reference is documented. |
 | Performance | Record bs64 service numbers and the lower-level in-process probe that explains the delta. |
 | Scope | State whether the optimization targets frontend/scheduler, CUDA graph, collectives, MLA, MoE, or sampling. |
@@ -37,6 +40,27 @@ Every kept optimization needs all of these recorded before commit:
 | Commit | Commit the code and this doc update together. |
 
 No optimization is accepted on performance numbers alone.
+
+Preferred entry shape:
+
+```text
+Profile:
+  <command + report path + bottleneck>
+Motivation / expected gain:
+  <why this change should move bs64, and by roughly how much>
+Microbench:
+  <isolated probe, or the reason a subsystem-only probe is not available>
+Correctness gate:
+  <hash / trace / reference path>
+Performance gate:
+  <bs64 service number + supporting in-process/profile number>
+Decision:
+  <keep/reject/defer + commit>
+```
+
+This is a discipline, not a rigid template. The important part is that future
+readers can reconstruct why an optimization was attempted, what it was expected
+to buy, and which evidence made it worth keeping.
 
 ## Baseline Commands
 
