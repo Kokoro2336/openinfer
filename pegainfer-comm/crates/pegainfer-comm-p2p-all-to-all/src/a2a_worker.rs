@@ -52,6 +52,7 @@ pub(crate) struct WorkerState {
     dp_size: usize,
     node_size: usize,
     world_size: usize,
+    canonicalize_duplicate_sources: bool,
     rank_handles: Vec<AllToAllRankHandle>,
     stop_flag: AtomicBool,
     device: u8,
@@ -116,6 +117,7 @@ impl WorkerState {
         dp_size: usize,
         node_size: usize,
         world_size: usize,
+        canonicalize_duplicate_sources: bool,
         num_routed_ptr: *mut u32,
         num_routed_mr: MemoryRegionHandle,
         send_buffer_ptr: *mut c_void,
@@ -250,6 +252,7 @@ impl WorkerState {
             dp_size,
             node_size,
             world_size,
+            canonicalize_duplicate_sources,
             rank_handles,
             stop_flag: AtomicBool::new(false),
             device,
@@ -370,7 +373,7 @@ impl WorkerState {
 
         // Register a callback to wait for the expected number of immediates.
         let num_shards = self.transfer_engine.nets_per_gpu().get() as u32;
-        let num_dispatch_tx = 1
+        let num_dispatch_tx = 2
             + if num_private_ranges == 0 { 0 } else { 1 }
             + if route.dispatch_ranges.is_empty() { 0 } else { 1 };
         let num_combine_tx = 1 + if self.world_size > self.node_size { 1 } else { 0 };
@@ -593,12 +596,22 @@ impl WorkerState {
                 }
             }
         }
-        self.tokens_per_expert.copy(&tokens_per_expert);
+        let mut compute_tokens_per_expert = tokens_per_expert.clone();
+        if self.canonicalize_duplicate_sources {
+            for local_expert in 0..num_local_experts {
+                let expert = first_local_expert + local_expert;
+                compute_tokens_per_expert[local_expert] = (0..num_dp_groups)
+                    .map(|dp_group| self.get_num_routed(dp_group, expert))
+                    .max()
+                    .unwrap_or(0);
+            }
+        }
+        self.tokens_per_expert.copy(&compute_tokens_per_expert);
 
         // Pad the per-expert counts.
         let mut padded_offset = Vec::with_capacity(num_local_experts);
         let mut base_expert_offset = 0;
-        for count in &tokens_per_expert {
+        for count in &compute_tokens_per_expert {
             let padded_count =
                 (*count as usize).div_ceil(self.expert_padding) * self.expert_padding;
             padded_offset.push(base_expert_offset);
@@ -666,8 +679,23 @@ impl WorkerState {
                         }
                     }
                     source_rank[last] = peer_rank as u32;
-                    padded_index[last] = padded_offset[local_expert]
-                        + (expert_count[local_expert] as u32);
+                    let expert_slot = if self.canonicalize_duplicate_sources {
+                        let compute_count =
+                            compute_tokens_per_expert[local_expert] as usize;
+                        debug_assert!(
+                            compute_count > 0,
+                            "canonicalized routed expert {expert} has no compute rows"
+                        );
+                        if compute_count == 0 {
+                            0
+                        } else {
+                            expert_count[local_expert] % compute_count
+                        }
+                    } else {
+                        expert_count[local_expert]
+                    };
+                    padded_index[last] =
+                        padded_offset[local_expert] + expert_slot as u32;
                     expert_count[local_expert] += 1;
                     last += 1;
                 }

@@ -104,6 +104,7 @@ impl PyAllToAllContext {
             dp_size,
             node_size,
             world_size,
+            false,
             num_routed_ptr as *mut u32,
             num_routed_mr.0,
             send_buffer_ptr as *mut c_void,

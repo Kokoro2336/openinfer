@@ -1,169 +1,177 @@
 # Kimi-K2 PPLX EP Correctness
 
-> **TL;DR:** TP8/EP8 PPLX decode is now token-trace exact against the TP8/EP8
-> NCCL path for the baseline probe. Clean 64-token validation on `h20-100`
-> produced the same hash for both paths: `4920f088c2338236`.
+> **Status:** TP8/DP1 PPLX decode is token-trace exact against the TP8/DP1
+> NCCL path under the same bs64 active-decode schedule on `h20-100`.
 >
-> **Status:** Baseline fixed and committed as a correctness ground truth before
-> performance work. TP1/DP8 PPLX remains a separate follow-up.
+> **Ground truth rule:** compare PPLX against TP8 NCCL with the same scheduler
+> shape. A single historical hash is not enough once admission changes make the
+> decode batch truly active at 64 rows.
 
 ## Scope
 
 Target comparison:
 
-- Model: `/data/models/Kimi-K2.5`
-- Machine: `h20-100`, 8x H20
-- Reference path: `PEGAINFER_KIMI_PARALLEL=tp8dp1`, feature `kimi-k2`
-- PPLX path: `PEGAINFER_KIMI_PARALLEL=tp8dp1`, feature `kimi-k2-pplx-ep`
-- Probe: `bench_serving request --output-len {32,64} --warmup 0 --iters 1 --cuda-graph false`
+| Item | Value |
+| --- | --- |
+| Machine | `h20-100`, 8x H20 |
+| Model | `/data/models/Kimi-K2.5` |
+| Reference path | `PEGAINFER_KIMI_PARALLEL=tp8dp1`, feature `kimi-k2` |
+| PPLX path | `PEGAINFER_KIMI_PARALLEL=tp8dp1`, feature `kimi-k2-pplx-ep` |
+| Probe | `bench_serving request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1 --cuda-graph false` |
 
-The TP1/DP8 path was intentionally left out of this baseline. During debug it
-matched the 12-token probe but diverged at 32 tokens, so it must not be treated
-as a correctness reference yet.
+TP1/DP8 PPLX is intentionally not the baseline for this document. The current
+repair first makes TP8/DP1 PPLX match TP8/DP1 NCCL.
 
 ## Validation Ledger
 
-| Path | Output len | Report | Trace hash | Result |
-| --- | ---: | --- | --- | --- |
-| TP8 NCCL | 32 | `/tmp/kimi_nccl_tp8_clean32.json` | `6266bc659f34d5ca` | Reference |
-| TP8 PPLX before final fixes | 32 | `/tmp/kimi_pplx_tp8_capacity32.json` | `6cf696c07640ef9f` | Diverged at generated token 4 |
-| TP8 PPLX after routed-row weight | 32 | `/tmp/kimi_pplx_tp8_weight32.json` | `feba4dadf1fc6c22` | First boundary fixed; diverged at token 5 |
-| TP8 PPLX final | 32 | `/tmp/kimi_pplx_tp8_final32.json` | `6266bc659f34d5ca` | Matches NCCL |
-| TP8 NCCL clean | 64 | `/tmp/kimi_nccl_tp8_clean64.json` | `4920f088c2338236` | Reference |
-| TP8 PPLX clean | 64 | `/tmp/kimi_pplx_tp8_clean64.json` | `4920f088c2338236` | Matches NCCL |
+| Date | Path | Output | Result |
+| --- | --- | --- | --- |
+| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving` | clean build on `h20-100` | Pass |
+| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2 --bin bench_serving` | clean build on `h20-100` | Pass |
+| 2026-05-25 | `cargo test --release -p pegainfer-comm --test pplx_roundtrip -- --nocapture` | 8 ranks dispatch+combine roundtrip, each rank received 512 tokens | Pass |
+| 2026-05-25 | TP8 PPLX bs4, output 5, iters 3 | `/tmp/kimi_pplx_tp8_bs4_o5_final.json`: 12/12 traces hash `7c4c5d83355198fd` | Pass |
+| 2026-05-25 | TP8 NCCL bs64 active decode | `/tmp/kimi_nccl_tp8_active64_o5_final.json`: `Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})`, steady TPOT p50 `97.53ms` | Reference |
+| 2026-05-25 | TP8 PPLX bs64 active decode | `/tmp/kimi_pplx_tp8_active64_o5_after_review.json`: `Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})`, steady TPOT p50 `110.14ms` | Matches NCCL |
+| 2026-05-25 | TP8 PPLX vs TP8 NCCL bs64 per-index traces | 0 mismatches across 64 requests | Pass |
 
-Shared 64-token prefix:
-
-```text
-[1215, 261, 5981, 14677, 1364, 91378, 2187, 924,
- 276, 3628, 308, 3862, 276, 7867, 11, 996]
-```
+The bs64 probe has two hashes because fully active 64-row decode has a different
+schedule from the earlier split-wave runs. The correctness condition is
+per-index trace equality between PPLX and NCCL for the same active scheduling.
 
 ## Repro Commands
+
+Common environment:
+
+```bash
+cd /root/develop/xingming/pegainfer
+export CUDA_HOME=/usr/local/cuda
+export NVCC=/usr/local/cuda/bin/nvcc
+export LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+export PEGAINFER_CUDA_SM=90a
+export PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python
+export PEGAINFER_KIMI_PARALLEL=tp8dp1
+```
 
 NCCL reference:
 
 ```bash
-cd /root/develop/xingming/pegainfer
-CUDA_HOME=/usr/local/cuda \
-NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
-PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
-PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-cargo run --release -p pegainfer-server --features kimi-k2 --bin bench_serving -- \
+cargo run --quiet --release -p pegainfer-server --features kimi-k2 --bin bench_serving -- \
   --model-path /data/models/Kimi-K2.5 \
   --cuda-graph false \
   --format json \
-  --out /tmp/kimi_nccl_tp8_clean64.json \
-  request --output-len 64 --warmup 0 --iters 1
+  --out /tmp/kimi_nccl_tp8_active64_o5_final.json \
+  request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
 PPLX path:
 
 ```bash
-cd /root/develop/xingming/pegainfer
-CUDA_HOME=/usr/local/cuda \
-NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
-PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
-PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
+cargo run --quiet --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
   --model-path /data/models/Kimi-K2.5 \
   --cuda-graph false \
   --format json \
-  --out /tmp/kimi_pplx_tp8_clean64.json \
-  request --output-len 64 --warmup 0 --iters 1
+  --out /tmp/kimi_pplx_tp8_active64_o5_after_review.json \
+  request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
-Hash comparison:
+Trace comparison:
 
 ```bash
 uv run --no-project python - <<'PY'
 import json
+from collections import Counter
 from pathlib import Path
 
 paths = {
-    "nccl64": Path("/tmp/kimi_nccl_tp8_clean64.json"),
-    "pplx64": Path("/tmp/kimi_pplx_tp8_clean64.json"),
+    "nccl": Path("/tmp/kimi_nccl_tp8_active64_o5_final.json"),
+    "pplx": Path("/tmp/kimi_pplx_tp8_active64_o5_after_review.json"),
 }
 traces = {}
 for name, path in paths.items():
     data = json.loads(path.read_text())
-    trace = data["metrics"]["generated_token_traces"][0]
-    traces[name] = trace
-    print(name, trace["hash"], trace["len"], trace["prefix"])
-print("match", traces["nccl64"] == traces["pplx64"])
+    rows = data["metrics"]["generated_token_traces"]
+    traces[name] = rows
+    print(name, Counter(row["hash"] for row in rows))
+
+mismatches = [
+    idx for idx, (a, b) in enumerate(zip(traces["nccl"], traces["pplx"]))
+    if a["tokens"] != b["tokens"]
+]
+print("mismatches", len(mismatches), mismatches[:16])
 PY
 ```
 
 ## Fixed Invariants
 
-### Receive capacity
+### Active MoE Rows
 
-The old PPLX receive scratch used an average per-expert estimate. That is wrong
-for EP all-to-all: any rank can receive skewed routes from all ranks. The bound
-is now:
+Decode arenas are bucketed up to 64 rows, but a specific decode step may have
+fewer active requests. PPLX MoE must route only active rows:
 
 ```text
-max_routes = max_total_tokens * topk
-active_experts = min(max_routes, local_experts)
-capacity = max_routes + active_experts * (expert_padding - 1)
+arena seq_len = allocated bucket rows
+active_len = token_ids.len()
+PPLX MoE seq_len = active_len
 ```
 
-For decode, `max_total_tokens = local_batch * ep_world`; for prefill, it is the
-synchronized prompt-token upper bound.
+`KimiWorkerDecodeScratch::set_moe_seq_len(active_len)` is applied only around
+the PPLX MoE layer and restored afterward. This prevents stale arena padding
+rows from entering PPLX dispatch and combine.
 
-### Routed-row weights
+### TP8 Duplicate Source Canonicalization
+
+In TP8/DP1 each TP rank has the same post-collective hidden rows and the same
+router result. PPLX all-to-all still observes eight source ranks, so the compact
+Marlin route must canonicalize duplicate source groups when the Kimi PPLX
+backend opts in:
+
+```text
+transfer counts = total rows across sources
+compute counts = max rows per canonical TP source group
+padded row for duplicate sources = canonical padded row
+```
+
+The flag is `canonicalize_duplicate_sources`. It is enabled only when Kimi runs
+TP8/DP1 PPLX, where TP sources are duplicate rows. TP1/DP8, lower-level PPLX
+tools, and Python bindings keep the default `false`.
+
+### NCCL-Layout Local Expert Compute For TP8
+
+For TP8/DP1 PPLX decode, the current correctness path computes local experts
+with the same NCCL-layout Marlin routing used by the NCCL path, then scatters
+the global route rows into the compact PPLX combine layout. PPLX remains
+responsible for the combine transfer.
+
+This preserves:
+
+```text
+router top-k -> NCCL Marlin route-slot layout -> W2 applies router weight
+-> BF16 expert row -> PPLX compact combine -> F32 routed output
+```
+
+The PPLX dispatch step is still executed to drive PPLX metadata and protocol.
+Removing unnecessary TP8 duplicate payload movement is a performance item, not
+part of the correctness baseline.
+
+### Routed-Row Weights
 
 NCCL applies the router top-k weight inside Marlin W2 before the BF16 expert row
-is stored. PPLX must preserve the same rounding boundary:
+is stored. PPLX must preserve the same rounding boundary. Kimi PPLX W2 receives
+the real route weights, while `combine_recv` uses dummy all-ones weights because
+the expert row is already weighted.
 
-```text
-NCCL: router weight -> W2 mul_topk_weights=true -> BF16 row -> F32 sum
-PPLX: router weight -> dispatch row metadata -> W2 mul_topk_weights=true -> F32 combine
-```
-
-The PPLX dispatch kernel stores `route.weight` in the 16-byte token tail after
-the optional scale payload, at `token_dim + token_scale_dim`. The receive kernel
-copies that value into `pplx_recv_topk_weight` using the same expert-major
-padded row order as `pplx_recv_hidden`. Kimi's PPLX W2 then passes that weight
-buffer with `mul_topk_weights=true`.
-
-When `hidden_dim_scale > 0`, the scale payload remains owned by the normal
-scale path; route-weight export through `out_x_scale_ptr` is only used for the
-BF16 Kimi path where `hidden_dim_scale == 0`.
-
-### F32 combine output
-
-The final routed expert combine must not round through BF16 before the Kimi
-router scale and residual/shared-expert merge. Kimi now bootstraps PPLX with
-`out_dtype = F32`; `combine_recv` writes directly to `pplx_routed_f32`, uses an
-element stride of `KIMI_K2_HIDDEN`, and passes dummy all-ones weights because W2
-has already applied the router weight.
-
-### No silent fallback
+### No Silent Fallback
 
 The `kimi-k2-pplx-ep` feature must fail startup if PPLX bootstrap fails. A
 silent fallback to NCCL would make correctness probes pass for the wrong path.
-The baseline run also checks for the runtime log:
+The runtime log should include:
 
 ```text
 kimi-k2: pplx EP backends installed on all 8 ranks
 ```
 
-## Rejected Attempts
+## Dump Policy
 
-| Attempt | Result | Reason |
-| --- | --- | --- |
-| Capacity-only fix | 32-token PPLX hash `6cf696c07640ef9f` | Necessary for skew safety, but not enough for TP8 parity. |
-| Combine-side weighted rounding | First token changed to `841` in the earlier bs1 probe | Weighting after BF16 W2 output is too late to match NCCL. |
-| F32 combine without routed-row W2 weights | Earlier divergence moved but did not disappear | It fixed one rounding boundary while leaving W2 weighting in the wrong place. |
-
-## Dump Notes
-
-A wide dump was used during the repair under `/tmp/kimi-pplx-dump/` to compare
-NCCL and PPLX layer states. The dump instrumentation was removed before this
-baseline: production code must not contain `dump_point`, `worker::dump`, or
-`pplx_routed_out` leftovers.
+Wide dumps are acceptable during repair, but production code must not retain
+debug markers or dump helpers. The baseline code has no `KimiDebugDecodeMarker`,
+`debug_dump_*`, `dump_point`, or `pplx_routed_out` leftovers.

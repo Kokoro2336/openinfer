@@ -637,6 +637,9 @@ __global__ void kimi_pplx_build_marlin_routing_kernel(
   __shared__ int offsets[65];
 
   int tid = threadIdx.x;
+  for (int block = tid; block < max_m_blocks; block += blockDim.x) {
+    expert_ids[block] = 0;
+  }
 
   int padded = 0;
   int count = 0;
@@ -679,6 +682,28 @@ __global__ void kimi_pplx_build_marlin_routing_kernel(
   }
 }
 
+__global__ void kimi_scatter_marlin_routes_to_compact_kernel(
+    const __nv_bfloat16* __restrict__ global_routes,
+    __nv_bfloat16* __restrict__ compact_routes,
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ num_tokens_post_padded,
+    int route_elems,
+    int hidden_dim) {
+  int rows = num_tokens_post_padded[0];
+  if (rows <= 0) return;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * hidden_dim;
+  if (idx >= total) return;
+  int row = idx / hidden_dim;
+  int col = idx - row * hidden_dim;
+  int src_row = sorted_token_ids[row];
+  if (src_row >= 0 && src_row < route_elems) {
+    compact_routes[idx] = global_routes[src_row * hidden_dim + col];
+  } else {
+    compact_routes[idx] = __float2bfloat16(0.0f);
+  }
+}
+
 CUresult kimi_pplx_build_marlin_routing_on_stream(
     const int32_t* recv_tokens_per_expert,
     int32_t* sorted_token_ids,
@@ -700,6 +725,34 @@ CUresult kimi_pplx_build_marlin_routing_on_stream(
       block_size,
       max_padded_tokens,
       max_m_blocks);
+  cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+}
+
+CUresult kimi_scatter_marlin_routes_to_compact_cuda(
+    const __nv_bfloat16* global_routes,
+    __nv_bfloat16* compact_routes,
+    const int32_t* sorted_token_ids,
+    const int32_t* num_tokens_post_padded,
+    int route_elems,
+    int compact_rows,
+    int hidden_dim,
+    cudaStream_t stream) {
+  if (global_routes == nullptr || compact_routes == nullptr ||
+      sorted_token_ids == nullptr || num_tokens_post_padded == nullptr ||
+      route_elems <= 0 || compact_rows <= 0 || hidden_dim <= 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = compact_rows * hidden_dim;
+  int threads = 256;
+  int blocks = (total + threads - 1) / threads;
+  kimi_scatter_marlin_routes_to_compact_kernel<<<blocks, threads, 0, stream>>>(
+      global_routes,
+      compact_routes,
+      sorted_token_ids,
+      num_tokens_post_padded,
+      route_elems,
+      hidden_dim);
   cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }

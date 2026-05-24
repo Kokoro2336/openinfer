@@ -106,6 +106,8 @@ void a2a_dispatch_recv_kernel(
         }
     }
     __syncthreads();
+    fence_acquire_system();
+    __syncthreads();
 
     // Wait for the worker to indicate the number of tokens received.
     const unsigned num_recv_tokens = ld_volatile_u32(num_recv_tokens_ptr);
@@ -184,6 +186,8 @@ void a2a_dispatch_recv_kernel(
         }
     }
     __syncthreads();
+    fence_acquire_system();
+    __syncthreads();
 
     // Copy the tokens into the output buffer.
     unsigned num_local_tokens = 0;
@@ -234,6 +238,7 @@ void a2a_dispatch_recv_kernel(
     }
 
     __syncthreads();
+    grid.sync();
 
     if (threadIdx.x == 0) {
         bool recv_complete = false;

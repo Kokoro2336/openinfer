@@ -19,8 +19,7 @@
 //! is written to a separate buffer. The KIMI_K2_ROUTER_SCALE is applied
 //! only to the routed part before adding to the residual + shared expert.
 
-use std::ffi::c_void;
-use std::ptr;
+use std::{ffi::c_void, ptr};
 
 use anyhow::{Context, Result};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
@@ -29,10 +28,12 @@ use pegainfer_comm::{EpBackend, ScalarType};
 use pegainfer_kernels::{
     ops::{
         KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiRouterBatch,
-        KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, kimi_marlin_w13_swiglu_pplx,
-        kimi_marlin_wna16_pplx_w2_gemm, kimi_marlin_wna16_pplx_w13_gemm,
-        kimi_pplx_build_marlin_routing_on_stream, kimi_router_noaux_tc_launch,
-        kimi_scaled_add_f32_bf16_to_bf16,
+        KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, kimi_marlin_w13_swiglu,
+        kimi_marlin_w13_swiglu_pplx, kimi_marlin_wna16_pplx_w2_gemm,
+        kimi_marlin_wna16_pplx_w13_gemm, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
+        kimi_moe_marlin_align_block_size, kimi_pplx_build_marlin_routing_on_stream,
+        kimi_router_noaux_tc_launch, kimi_scaled_add_f32_bf16_to_bf16,
+        kimi_scatter_marlin_routes_to_compact,
     },
     tensor::{DeviceContext, GpuTensor, NormWeight},
     typed_ops,
@@ -54,6 +55,7 @@ use super::worker::{KimiMoeForwardCache, KimiWorkerDecodeScratch, MARLIN_W13_OUT
 pub(super) const PPLX_EXPERT_PADDING: usize = 8;
 
 pub(super) struct KimiMoePplxScratch {
+    pub(super) max_local_output_tokens: usize,
     pub(super) expert_padding: usize,
     pub(super) pplx_recv_capacity: usize,
     pub(super) recv_tokens_per_expert: CudaSlice<i32>,
@@ -105,6 +107,7 @@ impl KimiMoePplxScratch {
         let pplx_dummy_topk_weight = ctx.stream.clone_htod(&dummy_weights)?;
 
         Ok(Self {
+            max_local_output_tokens,
             expert_padding: PPLX_EXPERT_PADDING,
             pplx_recv_capacity,
             recv_tokens_per_expert: ctx.stream.alloc_zeros(KIMI_K2_EP8_LOCAL_EXPERTS)?,
@@ -226,7 +229,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
     ctx.stream
         .wait(&route_ready)
         .with_context(|| format!("Kimi MoE PPLX layer {layer_idx} main wait route_ready"))?;
-
     // ---- 4. dispatch_send ----
     {
         let (x_ptr, _x_guard) = scratch.mla.normed.data.device_ptr(&ctx.stream);
@@ -271,16 +273,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
         .with_context(|| format!("pplx dispatch_recv layer {layer_idx}"))?;
     }
 
-    // ---- 6. Build Marlin routing ----
-    let routing = kimi_pplx_build_marlin_routing_on_stream(
-        ctx,
-        &mut pplx.pplx_route_workspace,
-        &pplx.recv_tokens_per_expert,
-        pplx.expert_padding,
-        pplx.pplx_recv_capacity,
-    )
-    .with_context(|| format!("pplx build Marlin routing layer {layer_idx}"))?;
-
     let layer_weights = expert_kernels
         .layers
         .iter()
@@ -290,39 +282,98 @@ pub(super) fn forward_moe_layer_decode_pplx(
         })?
         .as_marlin_weights();
 
-    // ---- 7. Marlin W13 (gate+up) GEMM ----
-    pplx.pplx_recv_hidden.seq_len = routing.route_elems;
-    pplx.pplx_w13_out.seq_len = routing.route_elems;
-    kimi_marlin_wna16_pplx_w13_gemm(
-        ctx,
-        &mut pplx.pplx_marlin_workspace,
-        &routing,
-        &pplx.pplx_recv_hidden,
-        &layer_weights.w13,
-        &pplx.pplx_dummy_topk_weight,
-        &mut pplx.pplx_w13_out,
-    )?;
+    if comm.is_some() {
+        // TP8/DP1 keeps the post-collective hidden state identical on every
+        // rank, so compute local experts with the NCCL Marlin routing and use
+        // PPLX only for the combine transfer. This preserves NCCL's route-slot
+        // layout and BF16 rounding behavior.
+        let routing = kimi_moe_marlin_align_block_size(
+            ctx,
+            &mut scratch.marlin_route_workspace,
+            &scratch.router.router_topk_idx.data,
+            seq_len,
+            seq_len,
+            expert_kernels.local_expert_range.start,
+        )
+        .with_context(|| format!("pplx tp8 build NCCL-layout routing layer {layer_idx}"))?;
 
-    // ---- 8. SwiGLU activation (GPU reads actual row count, no D2H) ----
-    pplx.pplx_activated.seq_len = routing.route_elems;
-    kimi_marlin_w13_swiglu_pplx(
-        ctx,
-        &pplx.pplx_w13_out,
-        routing.num_tokens_post_padded,
-        &mut pplx.pplx_activated,
-    )?;
+        scratch.marlin.w13_out.seq_len = routing.route_elems;
+        scratch.marlin.activated.seq_len = routing.route_elems;
+        scratch.marlin.expert_output.seq_len = routing.route_elems;
+        ctx.stream.memset_zeros(&mut scratch.marlin.w13_out.data)?;
+        ctx.stream
+            .memset_zeros(&mut scratch.marlin.expert_output.data)?;
+        kimi_marlin_wna16_w13_gemm(
+            ctx,
+            &mut scratch.marlin_workspace,
+            &routing,
+            &scratch.mla.normed,
+            &layer_weights.w13,
+            &scratch.router.router_topk_weight.data,
+            &mut scratch.marlin.w13_out,
+        )?;
+        kimi_marlin_w13_swiglu(ctx, &scratch.marlin.w13_out, &mut scratch.marlin.activated)?;
+        kimi_marlin_wna16_w2_gemm(
+            ctx,
+            &mut scratch.marlin_workspace,
+            &routing,
+            &scratch.marlin.activated,
+            &layer_weights.w2_down,
+            &scratch.router.router_topk_weight.data,
+            &mut scratch.marlin.expert_output,
+        )?;
+        pplx.pplx_expert_output.seq_len = routing.max_padded_tokens;
+        kimi_scatter_marlin_routes_to_compact(
+            ctx,
+            &scratch.marlin.expert_output,
+            &routing,
+            &mut pplx.pplx_expert_output,
+        )?;
+    } else {
+        // ---- 6. Build Marlin routing ----
+        let routing = kimi_pplx_build_marlin_routing_on_stream(
+            ctx,
+            &mut pplx.pplx_route_workspace,
+            &pplx.recv_tokens_per_expert,
+            pplx.expert_padding,
+            pplx.pplx_recv_capacity,
+        )
+        .with_context(|| format!("pplx build Marlin routing layer {layer_idx}"))?;
 
-    // ---- 9. Marlin W2 (down) GEMM ----
-    pplx.pplx_expert_output.seq_len = routing.route_elems;
-    kimi_marlin_wna16_pplx_w2_gemm(
-        ctx,
-        &mut pplx.pplx_marlin_workspace,
-        &routing,
-        &pplx.pplx_activated,
-        &layer_weights.w2_down,
-        &pplx.pplx_recv_topk_weight,
-        &mut pplx.pplx_expert_output,
-    )?;
+        // ---- 7. Marlin W13 (gate+up) GEMM ----
+        pplx.pplx_recv_hidden.seq_len = routing.route_elems;
+        pplx.pplx_w13_out.seq_len = routing.route_elems;
+        kimi_marlin_wna16_pplx_w13_gemm(
+            ctx,
+            &mut pplx.pplx_marlin_workspace,
+            &routing,
+            &pplx.pplx_recv_hidden,
+            &layer_weights.w13,
+            &pplx.pplx_dummy_topk_weight,
+            &mut pplx.pplx_w13_out,
+        )?;
+
+        // ---- 8. SwiGLU activation (GPU reads actual row count, no D2H) ----
+        pplx.pplx_activated.seq_len = routing.route_elems;
+        kimi_marlin_w13_swiglu_pplx(
+            ctx,
+            &pplx.pplx_w13_out,
+            routing.num_tokens_post_padded,
+            &mut pplx.pplx_activated,
+        )?;
+
+        // ---- 9. Marlin W2 (down) GEMM ----
+        pplx.pplx_expert_output.seq_len = routing.route_elems;
+        kimi_marlin_wna16_pplx_w2_gemm(
+            ctx,
+            &mut pplx.pplx_marlin_workspace,
+            &routing,
+            &pplx.pplx_activated,
+            &layer_weights.w2_down,
+            &pplx.pplx_recv_topk_weight,
+            &mut pplx.pplx_expert_output,
+        )?;
+    }
 
     // ---- 10. combine_send ----
     {
@@ -356,7 +407,6 @@ pub(super) fn forward_moe_layer_decode_pplx(
         )
         .with_context(|| format!("pplx combine_recv layer {layer_idx}"))?;
     }
-
     // Combine: hidden = hidden + shared + routed * scale
     typed_ops::add_into(
         ctx,

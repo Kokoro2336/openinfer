@@ -1,6 +1,8 @@
 //! Typed Kimi decode scratch buffers.
 
 use anyhow::Result;
+#[cfg(feature = "pplx-ep")]
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use pegainfer_kernels::gpu_buffers;
 use pegainfer_kernels::tensor::{DeviceContext, GpuTensor, HiddenStates};
@@ -171,4 +173,50 @@ pub(crate) struct KimiWorkerDecodeScratch {
     pub(crate) marlin_workspace: KimiMarlinWna16Workspace,
     pub(crate) comm: CommScratch,
     pub(crate) sampling: SamplingScratch,
+}
+
+impl KimiWorkerDecodeScratch {
+    #[cfg(feature = "pplx-ep")]
+    pub(crate) fn set_moe_seq_len(&mut self, seq_len: usize) -> Result<()> {
+        set_gpu_tensor_seq_len("mla.hidden", &mut self.mla.hidden, seq_len)?;
+        set_gpu_tensor_seq_len("mla.normed", &mut self.mla.normed, seq_len)?;
+        set_gpu_tensor_seq_len("mla.projected", &mut self.mla.projected, seq_len)?;
+        set_hidden_states_seq_len(
+            "shared_expert.gate_up",
+            &mut self.shared_expert.gate_up,
+            seq_len,
+        )?;
+        set_hidden_states_seq_len(
+            "shared_expert.activated",
+            &mut self.shared_expert.activated,
+            seq_len,
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "pplx-ep")]
+fn set_gpu_tensor_seq_len<const DIM: usize>(
+    name: &str,
+    tensor: &mut GpuTensor<DIM>,
+    seq_len: usize,
+) -> Result<()> {
+    ensure!(
+        seq_len > 0 && seq_len * DIM <= tensor.data.len(),
+        "{name} seq_len {seq_len} exceeds storage rows {}",
+        tensor.data.len() / DIM
+    );
+    tensor.seq_len = seq_len;
+    Ok(())
+}
+
+#[cfg(feature = "pplx-ep")]
+fn set_hidden_states_seq_len(name: &str, states: &mut HiddenStates, seq_len: usize) -> Result<()> {
+    ensure!(
+        seq_len > 0 && seq_len * states.hidden_dim <= states.data.len(),
+        "{name} seq_len {seq_len} exceeds storage rows {}",
+        states.data.len() / states.hidden_dim
+    );
+    states.seq_len = seq_len;
+    Ok(())
 }

@@ -4,20 +4,6 @@ impl KimiRankThreadState {
     #[cfg(feature = "pplx-ep")]
     pub(super) fn enable_pplx(&mut self, ep_backend: pegainfer_comm::EpBackend) -> Result<()> {
         self.ctx.set_current()?;
-        if self.moe_pplx_scratch.is_none() {
-            self.moe_pplx_scratch = Some(
-                crate::runner::moe_pplx::KimiMoePplxScratch::new_decode(
-                    &self.ctx.as_device_context(),
-                    KIMI_DECODE_MAX_BATCH,
-                )
-                .with_context(|| {
-                    format!(
-                        "Kimi rank {} PPLX scratch allocation",
-                        self.sliced_load_plan.rank
-                    )
-                })?,
-            );
-        }
         self.ep_backend = Some(ep_backend);
         self.enable_cuda_graph = false;
         Ok(())
@@ -115,13 +101,35 @@ impl KimiRankThreadState {
 
     pub(super) fn ensure_decode_arena(&mut self, decode_batch_size: usize) -> Result<()> {
         self.ctx.set_current()?;
-        let loaded = self.loaded.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("Kimi rank weights must be loaded before decode arena allocation")
-        })?;
         let device_ctx = self.ctx.as_device_context();
-        let _ = loaded
-            .decode_arenas
-            .get_mut(&device_ctx, decode_batch_size)?;
+        #[cfg(feature = "pplx-ep")]
+        let (rank, arena_batch_size) = {
+            let loaded = self.loaded.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("Kimi rank weights must be loaded before decode arena allocation")
+            })?;
+            let arena = loaded
+                .decode_arenas
+                .get_mut(&device_ctx, decode_batch_size)?;
+            (loaded.gpu.rank, arena.batch_size)
+        };
+        #[cfg(not(feature = "pplx-ep"))]
+        {
+            let loaded = self.loaded.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("Kimi rank weights must be loaded before decode arena allocation")
+            })?;
+            let _ = loaded
+                .decode_arenas
+                .get_mut(&device_ctx, decode_batch_size)?;
+        }
+        #[cfg(feature = "pplx-ep")]
+        if self.ep_backend.is_some() {
+            ensure_pplx_decode_scratch(
+                &device_ctx,
+                rank,
+                &mut self.moe_pplx_scratch,
+                arena_batch_size,
+            )?;
+        }
         Ok(())
     }
 
@@ -192,7 +200,7 @@ impl KimiRankThreadState {
             .with_context(|| format!("Kimi rank {rank} upload batch decode tokens"))?;
 
         let local_heads = self.local_dims.local_heads;
-        if self.enable_cuda_graph {
+        let forward_result = if self.enable_cuda_graph {
             let mut graph = std::mem::take(&mut decode_arena.graph);
             let graph_barrier = Arc::clone(&self.collective_barrier);
             let result = graph.run_or_capture_synchronized(
@@ -208,6 +216,7 @@ impl KimiRankThreadState {
                         cache,
                         expert_kernels,
                         decode_arena,
+                        active_len,
                         local_heads,
                         #[cfg(feature = "pplx-ep")]
                         None,
@@ -215,14 +224,27 @@ impl KimiRankThreadState {
                 },
             );
             decode_arena.graph = graph;
-            result?;
+            result
         } else {
             #[cfg(feature = "pplx-ep")]
-            let mut pplx_ctx = self
-                .ep_backend
-                .as_mut()
-                .zip(self.moe_pplx_scratch.as_mut())
-                .map(|(ep, scratch)| PplxDecodeContext { ep, scratch });
+            if self.ep_backend.is_some() {
+                ensure_pplx_decode_scratch(
+                    &device_ctx,
+                    rank,
+                    &mut self.moe_pplx_scratch,
+                    decode_arena.batch_size,
+                )?;
+            }
+            #[cfg(feature = "pplx-ep")]
+            let mut pplx_ctx = match self.ep_backend.as_mut() {
+                Some(ep) => {
+                    let scratch = self.moe_pplx_scratch.as_mut().ok_or_else(|| {
+                        anyhow::anyhow!("Kimi rank {rank} PPLX decode scratch is missing")
+                    })?;
+                    Some(PplxDecodeContext { ep, scratch })
+                }
+                None => None,
+            };
             forward_decode_batch_next_token_kernels(
                 &device_ctx,
                 &decode_aux_ctx,
@@ -230,11 +252,13 @@ impl KimiRankThreadState {
                 cache,
                 expert_kernels,
                 decode_arena,
+                active_len,
                 local_heads,
                 #[cfg(feature = "pplx-ep")]
                 pplx_ctx.as_mut(),
-            )?;
-        }
+            )
+        };
+        forward_result?;
 
         let local_top1 = read_local_top1_batch_values(
             &device_ctx,
@@ -606,4 +630,25 @@ impl KimiRankThreadState {
             next_hidden,
         )
     }
+}
+
+#[cfg(feature = "pplx-ep")]
+fn ensure_pplx_decode_scratch(
+    ctx: &DeviceContext,
+    rank: usize,
+    scratch: &mut Option<crate::runner::moe_pplx::KimiMoePplxScratch>,
+    batch_size: usize,
+) -> Result<()> {
+    let needs_alloc = match scratch.as_ref() {
+        Some(scratch) => scratch.max_local_output_tokens < batch_size,
+        None => true,
+    };
+    if needs_alloc {
+        *scratch = Some(
+            crate::runner::moe_pplx::KimiMoePplxScratch::new_decode(ctx, batch_size).with_context(
+                || format!("Kimi rank {rank} PPLX decode scratch allocation bs{batch_size}"),
+            )?,
+        );
+    }
+    Ok(())
 }

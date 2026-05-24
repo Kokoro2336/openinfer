@@ -46,6 +46,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         uint32_t rank;
     };
     __shared__ Stage shared_stages[NUM_STAGES];
+    __shared__ uint32_t shared_counter;
     Stage local_stages[NUM_STAGES];
 
     // Local copy of peer recv ptrs.
@@ -66,18 +67,23 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     // Pick a token to send.
     unsigned token = blockIdx.x;
 
-    // Synchronization counter.
-    auto counter = *sync_counter;
-
     // Wait for all transactions using the send buffer to finish before writing to it.
     if (warp_id == 0) {
         if (elect_one_sync()) {
             while (ld_mmio_b8(tx_ready) == 0);
+            shared_counter = *sync_counter;
             if (num_fabric_tokens == 0) {
+                fence_release_system();
                 st_mmio_b8(combine_send_done, 1);
             }
         }
-    } else if (warp_id == 1) {
+    }
+    __syncthreads();
+    fence_acquire_system();
+    __syncthreads();
+    uint32_t counter = shared_counter;
+
+    if (warp_id == 1) {
         if constexpr (NODE_SIZE > 1) {
             auto local_rank = rank % NODE_SIZE;
             if (lane_id < NODE_SIZE) {
@@ -151,6 +157,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     if (threadIdx.x == 0) {
         auto num_tokens = add_release_gpu_u32(token_counter, num_local_fabric_tokens) + num_local_fabric_tokens;
         if (num_tokens == num_fabric_tokens) {
+            fence_release_system();
             st_mmio_b8(combine_send_done, 1);
         }
     }

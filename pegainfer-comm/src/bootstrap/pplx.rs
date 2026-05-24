@@ -56,6 +56,8 @@ pub struct PplxBootstrapParams {
     pub nets_per_gpu: u8,
     /// Imm-data base distinguishing this all-to-all on the fabric.
     pub imm_base: u32,
+    /// Reuse one canonical expert row for duplicate source groups.
+    pub canonicalize_duplicate_sources: bool,
 }
 
 impl Default for PplxBootstrapParams {
@@ -67,6 +69,7 @@ impl Default for PplxBootstrapParams {
             out_dtype: ScalarType::BF16,
             nets_per_gpu: 1,
             imm_base: 0x80000000,
+            canonicalize_duplicate_sources: false,
         }
     }
 }
@@ -481,6 +484,7 @@ fn run_phase2(
         max_recv_tokens: sizing.max_recv_tokens,
         max_private_tokens: sizing.max_private_tokens,
         expert_padding: params.expert_padding,
+        canonicalize_duplicate_sources: params.canonicalize_duplicate_sources,
     };
     let dtypes = EpDtypes {
         in_elemsize: sizing.in_elemsize,

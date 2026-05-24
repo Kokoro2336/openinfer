@@ -239,6 +239,7 @@ fn run_config(config: &BenchConfig) -> Result<Vec<Vec<IterTimes>>> {
         out_dtype: ScalarType::BF16,
         nets_per_gpu: config.nets_per_gpu,
         imm_base: 0x8a2a_0000,
+        canonicalize_duplicate_sources: false,
     };
 
     eprintln!(
@@ -552,10 +553,6 @@ fn max_rank_split_stats(rank_results: &[Vec<IterTimes>]) -> Stats {
         max_split_by_iter.push(max_us);
     }
     stats(&max_split_by_iter)
-}
-
-fn print_report_header(label: &str) {
-    println!("--- {label} ---");
 }
 
 fn print_report(rank_results: &[Vec<IterTimes>]) {

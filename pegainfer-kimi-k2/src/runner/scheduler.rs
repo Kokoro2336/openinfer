@@ -3,7 +3,7 @@ use std::{
     path::Path,
     sync::{Arc, Barrier, mpsc as std_mpsc},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -29,6 +29,8 @@ use crate::{
 };
 
 const KIMI_RUNNER_MAX_BATCH: usize = 64;
+const KIMI_PREFILL_BATCH_COALESCE: Duration = Duration::from_millis(20);
+const KIMI_PREFILL_BATCH_POLL: Duration = Duration::from_micros(50);
 
 pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     let parallel = resolve_parallel_config(&options)?;
@@ -238,6 +240,16 @@ impl KimiK2Scheduler {
             while let Ok(req) = submit_rx.try_recv() {
                 pending.push_back(req);
             }
+            let deadline = Instant::now() + KIMI_PREFILL_BATCH_COALESCE;
+            while pending.len() < KIMI_RUNNER_MAX_BATCH && Instant::now() < deadline {
+                match submit_rx.try_recv() {
+                    Ok(req) => pending.push_back(req),
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        thread::sleep(KIMI_PREFILL_BATCH_POLL);
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
 
             let mut batch = Vec::with_capacity(KIMI_RUNNER_MAX_BATCH);
             while batch.len() < KIMI_RUNNER_MAX_BATCH {
@@ -253,7 +265,17 @@ impl KimiK2Scheduler {
     }
 
     fn handle_request_batch(&mut self, reqs: Vec<GenerateRequest>) {
-        let decode_batch_size = reqs.len();
+        let mut prefill_reqs = Vec::with_capacity(reqs.len());
+        for req in reqs {
+            if let Some(req) = schedule_prefill_candidate(req) {
+                prefill_reqs.push(req);
+            }
+        }
+        if prefill_reqs.is_empty() {
+            return;
+        }
+
+        let decode_batch_size = prefill_reqs.len();
         if let Err(err) = self.runtime.ensure_decode_batch(decode_batch_size) {
             let message = format!(
                 "Kimi-K2 decode arena allocation failed for batch size {decode_batch_size} after {}/{} ranks loaded: {err:#}",
@@ -261,7 +283,7 @@ impl KimiK2Scheduler {
                 self.runtime.rank_count()
             );
             eprintln!("kimi-k2: {message}");
-            for req in reqs {
+            for req in prefill_reqs {
                 let _ = req.token_tx.send(TokenEvent::Error {
                     message: message.clone(),
                     prompt_tokens: req.prompt_tokens.len(),
@@ -270,8 +292,8 @@ impl KimiK2Scheduler {
             }
             return;
         }
-        let mut active = Vec::with_capacity(reqs.len());
-        for (slot, req) in reqs.into_iter().enumerate() {
+        let mut active = Vec::with_capacity(prefill_reqs.len());
+        for (slot, req) in prefill_reqs.into_iter().enumerate() {
             if let Some(active_req) = self.prefill_request(req, slot, decode_batch_size) {
                 active.push(active_req);
             }
@@ -369,29 +391,6 @@ impl KimiK2Scheduler {
         slot: usize,
         decode_batch_size: usize,
     ) -> Option<ActiveKimiRequest> {
-        let scheduled_at = unix_now_s();
-        let _ = req.token_tx.send(TokenEvent::Scheduled {
-            queued_at_unix_s: req.queued_at_unix_s.unwrap_or(scheduled_at),
-            scheduled_at_unix_s: scheduled_at,
-            prompt_tokens: req.prompt_tokens.len(),
-        });
-        if req.max_tokens == 0 {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: req.prompt_tokens.len(),
-                completion_tokens: 0,
-            });
-            return None;
-        }
-        if req.prompt_tokens.is_empty() {
-            let _ = req.token_tx.send(TokenEvent::Rejected {
-                message: "Kimi-K2 forward requires at least one prompt token".to_string(),
-                prompt_tokens: 0,
-                completion_tokens: 0,
-            });
-            return None;
-        }
-
         let completion_tokens = 0usize;
         let last_token = match self.runtime.forward_prompt_next_token_in_slot(
             req.prompt_tokens.clone(),
@@ -445,6 +444,32 @@ impl KimiK2Scheduler {
             decode_batch_size,
         })
     }
+}
+
+fn schedule_prefill_candidate(req: GenerateRequest) -> Option<GenerateRequest> {
+    let scheduled_at = unix_now_s();
+    let _ = req.token_tx.send(TokenEvent::Scheduled {
+        queued_at_unix_s: req.queued_at_unix_s.unwrap_or(scheduled_at),
+        scheduled_at_unix_s: scheduled_at,
+        prompt_tokens: req.prompt_tokens.len(),
+    });
+    if req.max_tokens == 0 {
+        let _ = req.token_tx.send(TokenEvent::Finished {
+            finish_reason: FinishReason::Length,
+            prompt_tokens: req.prompt_tokens.len(),
+            completion_tokens: 0,
+        });
+        return None;
+    }
+    if req.prompt_tokens.is_empty() {
+        let _ = req.token_tx.send(TokenEvent::Rejected {
+            message: "Kimi-K2 forward requires at least one prompt token".to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        });
+        return None;
+    }
+    Some(req)
 }
 
 struct KimiK2Runtime {
@@ -619,6 +644,8 @@ fn install_pplx_backends(config: &KimiK2RunnerConfig, workers: &[KimiRankWorker]
         max_num_tokens: 2048,
         expert_padding: crate::runner::moe_pplx::PPLX_EXPERT_PADDING,
         out_dtype: pegainfer_comm::ScalarType::F32,
+        canonicalize_duplicate_sources: config.parallel.tp_world > 1
+            && config.parallel.dp_world == 1,
         ..pegainfer_comm::bootstrap::PplxBootstrapParams::default()
     };
     let (backends, resources) = pegainfer_comm::bootstrap::build_intra_node_backends(

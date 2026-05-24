@@ -21,8 +21,8 @@
 
 The comparison target comes from [vllm-h20-baseline.md](vllm-h20-baseline.md).
 The correctness ground truth starts from
-[pplx-ep-correctness.md](pplx-ep-correctness.md): TP8 NCCL and TP8 PPLX both
-produce 64-token hash `4920f088c2338236` for the baseline probe.
+[pplx-ep-correctness.md](pplx-ep-correctness.md): TP8 PPLX must be token-trace
+exact against TP8 NCCL under the same bs64 active-decode schedule.
 
 ## Gate Rules
 
@@ -64,7 +64,8 @@ to buy, and which evidence made it worth keeping.
 
 ## Canonical Bs64 Pressure Test
 
-Use this exact service pressure-test shape for bs64 comparisons. Do not change
+Use this exact service pressure-test shape for bs64 comparisons. This is the
+single project-wide pressure command for Kimi-K2 bs64 reports. Do not change
 prompt/output length, request count, request rate, concurrency, percentiles,
 streaming mode, or `ignore-eos` when reporting numbers against the vLLM bs64
 baseline.
@@ -132,7 +133,8 @@ Required report fields:
 
 ## Correctness Probe
 
-Run this before accepting a performance change:
+Run this before accepting a performance change, and compare it with the TP8 NCCL
+reference from [pplx-ep-correctness.md](pplx-ep-correctness.md):
 
 ```bash
 cd /root/develop/xingming/pegainfer
@@ -147,7 +149,7 @@ cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_s
   --cuda-graph false \
   --format json \
   --out /tmp/kimi_pplx_tp8_correctness64.json \
-  request --output-len 64 --warmup 0 --iters 1
+  request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
 ## Optimization Ledger
@@ -157,6 +159,7 @@ cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_s
 | B0 | 2026-05-25 | `72c770b` | correctness | TP8 PPLX baseline fixed; no performance claim | TP8 NCCL/PPLX 64-token hash `4920f088c2338236` | Not measured | Keep as ground truth |
 | B1 | 2026-05-25 | `d639e55` code, `df1cd18` command doc | scheduler / service profile | Canonical bs64 pressure baseline before performance work | No code change after B0; PPLX correctness baseline remains `4920f088c2338236` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.json`: output `137.51 tok/s`, TPOT p50/p95/p99 `26.40/28.13/28.46ms`, TTFT p50/p99 `54.76/58.68s`, 256/256 success | Keep as profile baseline; first optimization should address 4-row scheduling/admission before kernel work |
 | O1 | 2026-05-25 | this commit | scheduler / decode arena | Raise DP1 TP8 admission to bs64; allocate decode arenas lazily in `1/2/4/8/16/32/64` buckets; preflight arena allocation on all TP ranks before prefill collectives | `/tmp/kimi_pplx_tp8_correctness64_o1_bucket.json`: TP8 PPLX 64-token hash `4920f088c2338236` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o1-bucket-07d6a40.json`: output `145.18 tok/s`, TPOT p50/p95/p99 `195.07/221.08/224.72ms`, TTFT p50/p99 `31.00/35.76s`, 256/256 success | Keep as bs64 enabling baseline; not enough for vLLM target, next profile must attack bs64 kernel/communication cost |
+| C1 | 2026-05-25 | this commit | correctness / PPLX MoE | Align TP8 PPLX with TP8 NCCL for active bs64 decode: active MoE rows, TP8-only duplicate-source canonicalization, NCCL-layout local expert compute before PPLX combine | `/tmp/kimi_pplx_tp8_active64_o5_after_review.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 per-index token mismatches; both paths hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | Not a performance optimization; PPLX correctness probe TPOT p50 `110.14ms` vs NCCL `97.53ms`; rerun canonical bs64 pressure after this correctness commit | Keep as the new correctness baseline before further optimization |
 
 ### B1 Profile Notes
 

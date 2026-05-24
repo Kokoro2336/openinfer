@@ -48,6 +48,8 @@ pub struct EpTopology {
     pub max_private_tokens: usize,
     /// Alignment padding applied within the combine buffer.
     pub expert_padding: usize,
+    /// Reuse one canonical expert row for duplicate source groups.
+    pub canonicalize_duplicate_sources: bool,
 }
 
 /// Wire-format dtypes.
@@ -184,6 +186,7 @@ impl EpBackend {
             topology.dp_size,
             topology.node_size,
             topology.world_size,
+            topology.canonicalize_duplicate_sources,
             buffers.num_routed_ptr,
             buffers.num_routed_mr,
             buffers.send_buffer_ptr,

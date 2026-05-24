@@ -90,6 +90,8 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
         }
     }
     __syncthreads();
+    fence_acquire_system();
+    __syncthreads();
 
     for (unsigned token = blockIdx.x, local_token = 0; token < num_send_tokens; token += gridDim.x, local_token++) {
         U *dstPtr = out_tokens_ptr + token * out_tokens_stride;

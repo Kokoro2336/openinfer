@@ -1546,6 +1546,44 @@ pub fn kimi_marlin_sum_topk_rows_f32<const DIM: usize>(
     Ok(())
 }
 
+pub fn kimi_scatter_marlin_routes_to_compact<const DIM: usize>(
+    ctx: &DeviceContext,
+    global_routes: &GpuTensor<DIM>,
+    routing: &KimiMarlinRouting<'_>,
+    compact_routes: &mut GpuTensor<DIM>,
+) -> Result<()> {
+    ensure!(
+        global_routes.seq_len == routing.route_elems,
+        "global route output seq_len must be {}, got {}",
+        routing.route_elems,
+        global_routes.seq_len
+    );
+    ensure!(
+        compact_routes.data.len() >= routing.max_padded_tokens * DIM,
+        "compact route output too small: have {}, need {}",
+        compact_routes.data.len(),
+        routing.max_padded_tokens * DIM
+    );
+    let (global_ptr, _global_guard) = global_routes.data.device_ptr(&ctx.stream);
+    let (compact_ptr, _compact_guard) = compact_routes.data.device_ptr_mut(&ctx.stream);
+    let (sorted_ptr, _sorted_guard) = routing.sorted_token_ids.device_ptr(&ctx.stream);
+    let (ntp_ptr, _ntp_guard) = routing.num_tokens_post_padded.device_ptr(&ctx.stream);
+    let result = unsafe {
+        ffi::kimi_scatter_marlin_routes_to_compact_cuda(
+            global_ptr as *const ffi::Half,
+            compact_ptr as *mut ffi::Half,
+            sorted_ptr as *const i32,
+            ntp_ptr as *const i32,
+            routing.route_elems as i32,
+            routing.max_padded_tokens as i32,
+            DIM as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// Build Marlin routing metadata on-stream from PPLX recv counts.
 ///
 /// Launches a <<<1,1>>> CUDA kernel that reads `recv_tokens_per_expert`,

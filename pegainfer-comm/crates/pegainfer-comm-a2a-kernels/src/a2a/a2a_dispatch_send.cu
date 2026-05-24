@@ -156,11 +156,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     auto block = cooperative_groups::this_thread_block();
 
     extern __shared__ std::byte shared_memory[];
+    __shared__ uint32_t shared_counter;
     constexpr size_t NUM_THREADS = NUM_WARPS * WARP_SIZE;
     const size_t warp_id = threadIdx.x / WARP_SIZE;
     const size_t lane_id = get_lane_id();
-
-    uint32_t counter = *sync_counter;
 
     const size_t node_rank = rank / NODE_SIZE;
     const size_t node_group = rank / dp_size;
@@ -180,13 +179,40 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         }
         __syncthreads();
 
-        for (uint32_t i = threadIdx.x; i < num_send_tokens * num_experts_per_token_bound; i += blockDim.x) {
-            const uint32_t token = i / num_experts_per_token_bound;
-            const uint32_t index = i % num_experts_per_token_bound;
-            const uint32_t expert = __ldg(&indices[token * indices_stride + index]);
+        const uint32_t route_elems = num_send_tokens * num_experts_per_token_bound;
+        if (num_send_tokens <= 64) {
+            for (uint32_t expert = threadIdx.x; expert < num_experts; expert += blockDim.x) {
+                uint32_t count = 0;
+                for (uint32_t route = 0; route < route_elems; ++route) {
+                    const uint32_t token = route / num_experts_per_token_bound;
+                    const uint32_t index = route % num_experts_per_token_bound;
+                    count += (__ldg(&indices[token * indices_stride + index]) == expert);
+                }
+                tokens_per_expert[expert] = count;
+            }
+            __syncthreads();
 
-            // Assign an offset to the token within the current rank and expert.
-            token_offset[i] = atomicAdd(&tokens_per_expert[expert], 1);
+            for (uint32_t route = threadIdx.x; route < route_elems; route += blockDim.x) {
+                const uint32_t token = route / num_experts_per_token_bound;
+                const uint32_t index = route % num_experts_per_token_bound;
+                const uint32_t expert = __ldg(&indices[token * indices_stride + index]);
+                uint32_t offset = 0;
+                for (uint32_t prev = 0; prev < route; ++prev) {
+                    const uint32_t prev_token = prev / num_experts_per_token_bound;
+                    const uint32_t prev_index = prev % num_experts_per_token_bound;
+                    offset += (__ldg(&indices[prev_token * indices_stride + prev_index]) == expert);
+                }
+                token_offset[route] = offset;
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < route_elems; i += blockDim.x) {
+                const uint32_t token = i / num_experts_per_token_bound;
+                const uint32_t index = i % num_experts_per_token_bound;
+                const uint32_t expert = __ldg(&indices[token * indices_stride + index]);
+
+                // Assign an offset to the token within the current rank and expert.
+                token_offset[i] = atomicAdd(&tokens_per_expert[expert], 1);
+            }
         }
         __syncthreads();
 
@@ -204,6 +230,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         }
         __syncthreads();
         if (threadIdx.x == 0) {
+            fence_release_system();
             st_mmio_b8(dispatch_route_done, 1);
         }
         for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
@@ -243,6 +270,16 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     }
     __syncthreads();
 
+    // Wait for all transactions using the send buffer to finish before writing to it.
+    if (threadIdx.x == 0) {
+        while (ld_mmio_b8(tx_ready) == 0);
+        shared_counter = *sync_counter;
+    }
+    __syncthreads();
+    fence_acquire_system();
+    __syncthreads();
+    uint32_t counter = shared_counter;
+
     // NVLink barrier set on the end of combine.
     if (NODE_SIZE > 1) {
         if (blockIdx.x == 0) {
@@ -251,11 +288,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 while (ld_volatile_u32(&sync_ptrs[local_rank][peer]) != counter);
             }
         }
-    }
-
-    // Wait for all transactions using the send buffer to finish before writing to it.
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        while (ld_mmio_b8(tx_ready) == 0);
     }
 
     grid.sync();
@@ -332,6 +364,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 if (threadIdx.x == 0) {
                     auto counter = add_release_gpu_u32(grid_counter, 1) + 1;
                     if (counter == num_send_tokens) {
+                        fence_release_system();
                         st_mmio_b8(dispatch_send_done, 1);
                         *grid_counter = 0;
                     }
@@ -382,6 +415,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 if (threadIdx.x == 0) {
                     auto counter = add_release_gpu_u32(grid_counter, 1) + 1;
                     if (counter == num_send_tokens) {
+                        fence_release_system();
                         st_mmio_b8(dispatch_send_done, 1);
                         *grid_counter = 0;
                     }
@@ -479,6 +513,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         if (threadIdx.x == 0) {
             auto counter = add_release_gpu_u32(grid_counter, num_local_tokens) + num_local_tokens;
             if (counter == num_send_tokens) {
+                fence_release_system();
                 st_mmio_b8(dispatch_send_done, 1);
                 *grid_counter = 0;
             }

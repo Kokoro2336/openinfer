@@ -7,9 +7,13 @@ pub(super) fn forward_decode_batch_next_token_kernels(
     cache: &KimiOneTokenForwardCache,
     expert_kernels: &KimiRankExpertMarlinWeights,
     decode_arena: &mut KimiWorkerDecodeArena,
+    active_len: usize,
     local_heads: usize,
     #[cfg(feature = "pplx-ep")] mut pplx: Option<&mut PplxDecodeContext<'_>>,
 ) -> Result<()> {
+    #[cfg(not(feature = "pplx-ep"))]
+    let _ = active_len;
+
     typed_ops::embedding_vocab_shard_into(
         device_ctx,
         &cache.token_embedding,
@@ -65,7 +69,9 @@ pub(super) fn forward_decode_batch_next_token_kernels(
             KimiLayerForwardKindCache::Moe(moe) => {
                 #[cfg(feature = "pplx-ep")]
                 if let Some(pplx_ctx) = pplx.as_mut() {
-                    crate::runner::moe_pplx::forward_moe_layer_decode_pplx(
+                    let arena_seq_len = decode_arena.scratch.mla.hidden.seq_len;
+                    decode_arena.scratch.set_moe_seq_len(active_len)?;
+                    let pplx_result = crate::runner::moe_pplx::forward_moe_layer_decode_pplx(
                         device_ctx,
                         decode_aux_ctx,
                         comm,
@@ -76,8 +82,10 @@ pub(super) fn forward_decode_batch_next_token_kernels(
                         expert_kernels,
                         &mut decode_arena.scratch,
                         pplx_ctx.scratch,
-                    )
-                    .with_context(|| {
+                    );
+                    let restore_result = decode_arena.scratch.set_moe_seq_len(arena_seq_len);
+                    restore_result?;
+                    pplx_result.with_context(|| {
                         format!("Kimi MoE PPLX batch decode layer {}", layer.layer_idx)
                     })?;
                 } else {
@@ -563,7 +571,6 @@ pub(super) fn forward_moe_layer_decode_into(
             &mut router_output,
         )?;
     }
-
     let routing = kimi_moe_marlin_align_block_size(
         aux_ctx,
         &mut scratch.marlin_route_workspace,
