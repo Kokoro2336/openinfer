@@ -168,6 +168,8 @@ Correctness constraints:
 - PPLX decode scratch capacity must be identical across ranks even when active row counts differ.
 - Padding decode and padding prefill execute real kernels and can write KV. They may only target unoccupied slots.
 - Every synchronized step must drain one result from every DP rank, including the error path, before the next command is sent.
+- Padding prefill failures are request failures; the owner request must not become active unless every rank completed its synchronized prefill step.
+- A missing rank forward thread is fatal for the process. Continuing with a partial DP command would leave surviving ranks inside unmatched PPLX collectives.
 - prompt_len1 admission at `append_position=0` must install request state after the first token, or finish/error the request in the same result pass.
 
 Microbench:

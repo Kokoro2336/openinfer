@@ -292,27 +292,32 @@ impl DpCoordinator {
         let prompt_len = req.prompt_tokens.len();
 
         let owner_result = self.result_rxs[dp_rank].recv();
+        let mut padding_errors = Vec::new();
         for r in 0..self.dp_world {
             if r != dp_rank {
-                let _ = self.result_rxs[r].recv();
+                match self.result_rxs[r].recv() {
+                    Ok(StepResult::Prefill(Ok(_))) => {}
+                    Ok(StepResult::Prefill(Err(err))) => {
+                        padding_errors.push(format!(
+                            "Kimi-K2 DP rank {r} padding prefill failed: {err:#}"
+                        ));
+                    }
+                    Ok(StepResult::Decode(_)) => {
+                        padding_errors.push(format!(
+                            "Kimi-K2 DP rank {r} returned decode result during prefill"
+                        ));
+                    }
+                    Err(_) => {
+                        padding_errors.push(format!(
+                            "Kimi-K2 DP rank {r} dropped prefill result channel"
+                        ));
+                    }
+                }
             }
         }
 
-        let last_token = match &owner_result {
-            Ok(StepResult::Prefill(Ok(report))) => {
-                let token_id = report.local_next_token_global_id;
-                if req
-                    .token_tx
-                    .send(TokenEvent::Token {
-                        id: token_id,
-                        logprob: None,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                token_id
-            }
+        let owner_report = match owner_result {
+            Ok(StepResult::Prefill(Ok(report))) => report,
             Ok(StepResult::Prefill(Err(err))) => {
                 eprintln!("kimi-k2: DP rank {dp_rank} prefill failed: {err:#}");
                 let _ = req.token_tx.send(TokenEvent::Error {
@@ -324,6 +329,29 @@ impl DpCoordinator {
             }
             _ => return,
         };
+
+        if !padding_errors.is_empty() {
+            let message = padding_errors.join("; ");
+            eprintln!("kimi-k2: {message}");
+            let _ = req.token_tx.send(TokenEvent::Error {
+                message,
+                prompt_tokens: prompt_len,
+                completion_tokens: 0,
+            });
+            return;
+        }
+
+        let last_token = owner_report.local_next_token_global_id;
+        if req
+            .token_tx
+            .send(TokenEvent::Token {
+                id: last_token,
+                logprob: None,
+            })
+            .is_err()
+        {
+            return;
+        }
 
         let completion_tokens = 1;
         if completion_tokens >= req.max_tokens {
@@ -361,7 +389,12 @@ impl DpCoordinator {
                         "Kimi-K2 DP rank {dp_rank} prompt_len1 decode rows exceed arena capacity {MAX_BATCH_PER_DP}"
                     ),
                 );
-                let _ = self.step_txs[dp_rank].send(build_padding_decode_command());
+                send_step_command(
+                    &self.step_txs[dp_rank],
+                    dp_rank,
+                    "prompt_len1 overflow padding decode",
+                    build_padding_decode_command(),
+                );
                 rows_by_rank.push(Vec::new());
                 continue;
             }
@@ -371,7 +404,7 @@ impl DpCoordinator {
             } else {
                 build_decode_command_from_rows(&rows)
             };
-            let _ = self.step_txs[dp_rank].send(cmd);
+            send_step_command(&self.step_txs[dp_rank], dp_rank, "prompt_len1 decode", cmd);
             rows_by_rank.push(rows);
         }
 
@@ -513,7 +546,7 @@ impl DpCoordinator {
                     ep_max_seq_len,
                 }
             };
-            let _ = self.step_txs[dp_rank].send(cmd);
+            send_step_command(&self.step_txs[dp_rank], dp_rank, "prefill", cmd);
         }
     }
 
@@ -521,7 +554,7 @@ impl DpCoordinator {
         // Build per-rank decode commands
         for dp_rank in 0..self.dp_world {
             let cmd = self.ranks[dp_rank].build_decode_command();
-            let _ = self.step_txs[dp_rank].send(cmd);
+            send_step_command(&self.step_txs[dp_rank], dp_rank, "decode", cmd);
         }
 
         // Collect results from all ranks
@@ -691,6 +724,18 @@ fn build_decode_command_from_inputs(inputs: &[DecodeInput]) -> StepCommand {
         positions: inputs.iter().map(|input| input.append_position).collect(),
         slots: inputs.iter().map(|input| input.slot).collect(),
         decode_batch_size: MAX_BATCH_PER_DP,
+    }
+}
+
+fn send_step_command(
+    tx: &std_mpsc::SyncSender<StepCommand>,
+    dp_rank: usize,
+    phase: &str,
+    command: StepCommand,
+) {
+    if tx.send(command).is_err() {
+        eprintln!("kimi-k2: fatal: DP rank {dp_rank} forward thread dropped before {phase}");
+        std::process::abort();
     }
 }
 
