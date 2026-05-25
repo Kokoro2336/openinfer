@@ -73,13 +73,13 @@
   - `PEGAINFER_CUDA_SM=120 cargo clippy --release --workspace --all-targets -- -D warnings`
   - `PEGAINFER_CUDA_SM=120 cargo build --release`
   - `PEGAINFER_CUDA_SM=120 cargo test --release -p pegainfer-qwen35-4b recurrent::tests::conv1d_prefill_handoff_matches_single_prefill -- --nocapture`
-  - `PEGAINFER_CUDA_SM=120 cargo run --release --bin bench_serving -- --model-path /data/code/workspace-rustllm/pegainfer/models/Qwen3.5-4B request --prompt-len 1 --output-len 1 --warmup 0 --iters 1`
+  - `PEGAINFER_CUDA_SM=120 cargo run --release --bin bench_serving -- --model-path $LOCAL_PEGAINFER_DIR/models/Qwen3.5-4B request --prompt-len 1 --output-len 1 --warmup 0 --iters 1`
 - Initial Qwen3.5 e2e failure:
-  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/code/workspace-rustllm/pegainfer/models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e -- --nocapture`
-  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/code/workspace-rustllm/pegainfer/models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e_scheduler -- --nocapture`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=$LOCAL_PEGAINFER_DIR/models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e -- --nocapture`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=$LOCAL_PEGAINFER_DIR/models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e_scheduler -- --nocapture`
   - Both initially produced all-case gibberish-output mismatches.
 - Control run:
-  - A temporary old-HEAD worktree at `/tmp/pegainfer-head` ran `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=/data/code/workspace-rustllm/pegainfer/.venv/bin/python PEGAINFER_TEST_MODEL_PATH=/data/code/workspace-rustllm/pegainfer/models/Qwen3.5-4B CARGO_TARGET_DIR=/tmp/pegainfer-head-target cargo test --release --test e2e_qwen35 -- --nocapture`.
+  - A temporary old-HEAD worktree at `$RESULT_ROOT/pegainfer-head` ran `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=$LOCAL_PEGAINFER_DIR/.venv/bin/python PEGAINFER_TEST_MODEL_PATH=$LOCAL_PEGAINFER_DIR/models/Qwen3.5-4B CARGO_TARGET_DIR=$RESULT_ROOT/pegainfer-head-target cargo test --release --test e2e_qwen35 -- --nocapture`.
   - Old HEAD failed the same way on all 10 Qwen3.5 cases, so the e2e mismatch predated this crate split.
 - Follow-up fix:
   - `docs/models/qwen35/e2e-gibberish.md` identified the first gibberish commit as `6a5b826`, fixed Qwen3.5 scheduler thread CUDA/cuBLAS binding, kept greedy sampling on FlashInfer top1, and refreshed the exact Qwen3.5 golden for the default engine shape.

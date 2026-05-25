@@ -1,7 +1,7 @@
 # Kimi-K2 PPLX EP Correctness
 
 > **Status:** TP8/DP1 PPLX decode is token-trace exact against the TP8/DP1
-> NCCL path under the same bs64 active-decode schedule on `h20-100`.
+> NCCL path under the same bs64 active-decode schedule on `H20 node`.
 >
 > **Ground truth rule:** compare PPLX against TP8 NCCL with the same scheduler
 > shape. A single historical hash is not enough once admission changes make the
@@ -13,8 +13,8 @@ Target comparison:
 
 | Item | Value |
 | --- | --- |
-| Machine | `h20-100`, 8x H20 |
-| Model | `/data/models/Kimi-K2.5` |
+| Machine | `H20 node`, 8x H20 |
+| Model | `$MODEL_DIR` |
 | Reference path | `PEGAINFER_KIMI_PARALLEL=tp8dp1`, feature `kimi-k2` |
 | PPLX path | `PEGAINFER_KIMI_PARALLEL=tp8dp1`, feature `kimi-k2-pplx-ep` |
 | Probe | `bench_serving request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1 --cuda-graph false` |
@@ -26,12 +26,12 @@ repair first makes TP8/DP1 PPLX match TP8/DP1 NCCL.
 
 | Date | Path | Output | Result |
 | --- | --- | --- | --- |
-| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving` | clean build on `h20-100` | Pass |
-| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2 --bin bench_serving` | clean build on `h20-100` | Pass |
+| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving` | clean build on `H20 node` | Pass |
+| 2026-05-25 | `cargo check --release -p pegainfer-server --features kimi-k2 --bin bench_serving` | clean build on `H20 node` | Pass |
 | 2026-05-25 | `cargo test --release -p pegainfer-comm --test pplx_roundtrip -- --nocapture` | 8 ranks dispatch+combine roundtrip, each rank received 512 tokens | Pass |
-| 2026-05-25 | TP8 PPLX bs4, output 5, iters 3 | `/tmp/kimi_pplx_tp8_bs4_o5_final.json`: 12/12 traces hash `7c4c5d83355198fd` | Pass |
-| 2026-05-25 | TP8 NCCL bs64 active decode | `/tmp/kimi_nccl_tp8_active64_o5_final.json`: `Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})`, steady TPOT p50 `97.53ms` | Reference |
-| 2026-05-25 | TP8 PPLX bs64 active decode | `/tmp/kimi_pplx_tp8_active64_o5_after_review.json`: `Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})`, steady TPOT p50 `110.14ms` | Matches NCCL |
+| 2026-05-25 | TP8 PPLX bs4, output 5, iters 3 | `$RESULT_ROOT/kimi_pplx_tp8_bs4_o5_final.json`: 12/12 traces hash `7c4c5d83355198fd` | Pass |
+| 2026-05-25 | TP8 NCCL bs64 active decode | `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`: `Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})`, steady TPOT p50 `97.53ms` | Reference |
+| 2026-05-25 | TP8 PPLX bs64 active decode | `$RESULT_ROOT/kimi_pplx_tp8_active64_o5_after_review.json`: `Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})`, steady TPOT p50 `110.14ms` | Matches NCCL |
 | 2026-05-25 | TP8 PPLX vs TP8 NCCL bs64 per-index traces | 0 mismatches across 64 requests | Pass |
 
 The bs64 probe has two hashes because fully active 64-row decode has a different
@@ -43,12 +43,12 @@ per-index trace equality between PPLX and NCCL for the same active scheduling.
 Common environment:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 export CUDA_HOME=/usr/local/cuda
 export NVCC=/usr/local/cuda/bin/nvcc
-export LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 export PEGAINFER_CUDA_SM=90a
-export PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python
+export PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python
 export PEGAINFER_KIMI_PARALLEL=tp8dp1
 ```
 
@@ -56,10 +56,10 @@ NCCL reference:
 
 ```bash
 cargo run --quiet --release -p pegainfer-server --features kimi-k2 --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph false \
   --format json \
-  --out /tmp/kimi_nccl_tp8_active64_o5_final.json \
+  --out $RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json \
   request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
@@ -67,10 +67,10 @@ PPLX path:
 
 ```bash
 cargo run --quiet --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph false \
   --format json \
-  --out /tmp/kimi_pplx_tp8_active64_o5_after_review.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_active64_o5_after_review.json \
   request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
@@ -83,8 +83,8 @@ from collections import Counter
 from pathlib import Path
 
 paths = {
-    "nccl": Path("/tmp/kimi_nccl_tp8_active64_o5_final.json"),
-    "pplx": Path("/tmp/kimi_pplx_tp8_active64_o5_after_review.json"),
+    "nccl": Path("$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json"),
+    "pplx": Path("$RESULT_ROOT/kimi_pplx_tp8_active64_o5_after_review.json"),
 }
 traces = {}
 for name, path in paths.items():

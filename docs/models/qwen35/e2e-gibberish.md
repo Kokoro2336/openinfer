@@ -26,8 +26,8 @@
 ## Execution Log
 
 ### Step 1: Reproduce and bisect through history
-- Created a temporary worktree at `/tmp/pegainfer-q35-debug` so the active model-crate diff stayed untouched.
-- Older commits needed the current local FlashInfer third-party tree copied into `third_party/flashinfer` and `PEGAINFER_TRITON_PYTHON=/data/code/workspace-rustllm/pegainfer/.venv/bin/python`.
+- Created a temporary worktree at `$RESULT_ROOT/pegainfer-q35-debug` so the active model-crate diff stayed untouched.
+- Older commits needed the current local FlashInfer third-party tree copied into `third_party/flashinfer` and `PEGAINFER_TRITON_PYTHON=$LOCAL_PEGAINFER_DIR/.venv/bin/python`.
 - Results:
   - `24be186 refactor(embedding): keep token ids unsigned end-to-end (#71)` passed Qwen3.5 e2e.
   - `020970b refactor(sampling): switch greedy decode to flashinfer top1 (#73)` failed a few cases with normal text, matching baseline drift rather than gibberish.
@@ -63,10 +63,10 @@
   - `cargo fmt --all --check`
   - `PEGAINFER_CUDA_SM=120 cargo check --release --workspace --all-targets`
   - `PEGAINFER_CUDA_SM=120 cargo clippy --release --workspace --all-targets -- -D warnings`
-  - Two-run same-seed regen comparison with temporary model alias `/tmp/Qwen35DetTest` while evaluating FlashInfer top1 behavior.
+  - Two-run same-seed regen comparison with temporary model alias `$RESULT_ROOT/Qwen35DetTest` while evaluating FlashInfer top1 behavior.
   - `PEGAINFER_CUDA_SM=120 cargo test --release -p pegainfer test_gpu_sample -- --nocapture`
-  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/code/workspace-rustllm/pegainfer/models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e -- --nocapture`
-  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=/data/code/workspace-rustllm/pegainfer/models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e_scheduler -- --nocapture`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=$LOCAL_PEGAINFER_DIR/models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e -- --nocapture`
+  - `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=$LOCAL_PEGAINFER_DIR/models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35-4b --test e2e_scheduler -- --nocapture`
   - `git diff --check`
 
 ## Debrief

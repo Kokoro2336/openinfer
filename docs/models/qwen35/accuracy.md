@@ -251,9 +251,9 @@ cargo test --release --test e2e_qwen35 -- --nocapture
 Current result:
 
 - fails immediately on `Hello`
-- because [test_data/Qwen3.5-4B.json](/data/code/workspace-rustllm/pegainfer/test_data/Qwen3.5-4B.json) is the old self-generated baseline
+- because [test_data/Qwen3.5-4B.json]($LOCAL_PEGAINFER_DIR/test_data/Qwen3.5-4B.json) is the old self-generated baseline
 - a fresh candidate baseline was generated to:
-  - [target/accuracy/Qwen3.5-4B.current.json](/data/code/workspace-rustllm/pegainfer/target/accuracy/Qwen3.5-4B.current.json)
+  - [target/accuracy/Qwen3.5-4B.current.json]($LOCAL_PEGAINFER_DIR/target/accuracy/Qwen3.5-4B.current.json)
 
 Important new finding while checking remaining HF mismatches:
 

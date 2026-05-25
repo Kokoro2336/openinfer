@@ -19,8 +19,8 @@ Use this document as the baseline contract before changing the DeepSeek V4 sched
 
 | Capability | Status | Evidence |
 | --- | --- | --- |
-| DeepSeek V4 engine load behind the OpenAI HTTP facade | Available for smoke testing | `pegainfer-server --features deepseek-v4 --bin pegainfer` starts an OpenAI server for `/data/DeepSeek-V4-Flash` on 8x RTX 5090 |
-| `/v1/models` | Available | The returned model id is the full model path: `/data/DeepSeek-V4-Flash` |
+| DeepSeek V4 engine load behind the OpenAI HTTP facade | Available for smoke testing | `pegainfer-server --features deepseek-v4 --bin pegainfer` starts an OpenAI server for `$MODEL_DIR` on 8x RTX 5090 |
+| `/v1/models` | Available | The returned model id is the full model path: `$MODEL_DIR` |
 | `/v1/completions` single-request greedy smoke | Available | Prompt `hello`, `max_tokens=4`, `temperature=0` returned a text completion and usage accounting |
 | Direct single-request TPOT/hash regression | Available | `bench_serving request --prompt-len 1 --output-len 160 --warmup 2 --iters 3 --seed 42` is the retained DeepSeek V4 decode gate |
 | HTTP multi-request serving benchmark | Not available as a correctness/perf claim | The HTTP facade can receive requests, but the DeepSeek V4 engine behind it is a single scheduler thread that handles one complete request at a time |
@@ -49,7 +49,7 @@ Start the HTTP endpoint:
 
 ```bash
 $CARGO_TARGET_DIR/release/pegainfer \
-  --model-path /data/DeepSeek-V4-Flash \
+  --model-path $MODEL_DIR \
   --port 18103
 ```
 
@@ -62,19 +62,19 @@ curl -sS http://127.0.0.1:18103/v1/models
 Expected shape:
 
 ```json
-{"object":"list","data":[{"id":"/data/DeepSeek-V4-Flash","object":"model","created":0,"owned_by":"vllm-frontend-rs"}]}
+{"object":"list","data":[{"id":"$MODEL_DIR","object":"model","created":0,"owned_by":"vllm-frontend-rs"}]}
 ```
 
 Verify single-request completion:
 
 ```bash
-cat >/tmp/dsv4_completion.json <<'JSON'
-{"model":"/data/DeepSeek-V4-Flash","prompt":"hello","max_tokens":4,"temperature":0}
+cat >$RESULT_ROOT/dsv4_completion.json <<'JSON'
+{"model":"$MODEL_DIR","prompt":"hello","max_tokens":4,"temperature":0}
 JSON
 
 curl -sS http://127.0.0.1:18103/v1/completions \
   -H "Content-Type: application/json" \
-  --data-binary @/tmp/dsv4_completion.json
+  --data-binary @$RESULT_ROOT/dsv4_completion.json
 ```
 
 Observed smoke result:
@@ -83,7 +83,7 @@ Observed smoke result:
 {
   "id": "cmpl-54f70147",
   "object": "text_completion",
-  "model": "/data/DeepSeek-V4-Flash",
+  "model": "$MODEL_DIR",
   "choices": [
     {
       "index": 0,
@@ -106,9 +106,9 @@ cargo run --release -p pegainfer-server \
   --bin bench_serving \
   --features deepseek-v4 \
   -- \
-  --model-path /data/DeepSeek-V4-Flash \
+  --model-path $MODEL_DIR \
   --format json \
-  --out /tmp/dsv4_direct_request.json \
+  --out $RESULT_ROOT/dsv4_direct_request.json \
   request \
   --prompt-len 1 \
   --output-len 160 \

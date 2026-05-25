@@ -30,7 +30,7 @@ struct Cli {
     out: Option<PathBuf>,
     #[arg(long, default_value_t = DEFAULT_ITERS)]
     iters: u64,
-    #[arg(long, default_value = "/data/models/Kimi-K2.5")]
+    #[arg(long, default_value = "models/Kimi-K2.5")]
     model_path: String,
     #[arg(long, value_enum, default_value_t = TraceSource::Runtime)]
     source: TraceSource,

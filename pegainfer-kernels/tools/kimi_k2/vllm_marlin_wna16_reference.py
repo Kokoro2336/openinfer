@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import tempfile
 from pathlib import Path
 
 import torch
@@ -144,7 +145,7 @@ def build_real_kimi_layer_weights(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out-dir", default="/tmp/kimi_marlin_wna16_reference")
+    parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--tokens", type=int, default=4)
     parser.add_argument("--block-size", type=int, default=8)
     parser.add_argument("--model-path", type=Path)
@@ -152,7 +153,7 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=0)
     args = parser.parse_args()
 
-    out_dir = Path(args.out_dir)
+    out_dir = args.out_dir or Path(tempfile.gettempdir()) / "kimi_marlin_wna16_reference"
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
 

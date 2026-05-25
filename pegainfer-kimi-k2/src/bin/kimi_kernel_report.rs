@@ -39,7 +39,7 @@ struct RunArgs {
     iters: u64,
     #[arg(long)]
     out: Option<PathBuf>,
-    #[arg(long, default_value = "/data/models/Kimi-K2.5")]
+    #[arg(long, default_value = "models/Kimi-K2.5")]
     model_path: String,
     #[arg(long, value_enum, default_value_t = TraceSource::Runtime)]
     source: TraceSource,
@@ -53,7 +53,7 @@ struct TraceArgs {
     kv_len: usize,
     #[arg(long)]
     out: Option<PathBuf>,
-    #[arg(long, default_value = "/data/models/Kimi-K2.5")]
+    #[arg(long, default_value = "models/Kimi-K2.5")]
     model_path: String,
     #[arg(long, value_enum, default_value_t = TraceSource::Runtime)]
     source: TraceSource,

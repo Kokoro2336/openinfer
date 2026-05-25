@@ -37,8 +37,8 @@ Current evidence:
 | Requirement | Evidence | Status |
 | --- | --- | --- |
 | Main objective: stable sub-`25ms/token` DeepSeek V4 decode without bs=1 or seq_len=1 specialization | Best retained repeats reached the `26.28-27.31ms/token` band; fresh 5-run stability sweep after the latest rejected act_quant probe is `28.29-28.91ms` aggregate steady TPOT while another CPU load was running | Not achieved. Keep the goal active. |
-| Fixed bench stable sub-30 with hash `6346f03343d75a65` | `/tmp/dsv4_stability_after_act_quant_revert_{1..5}.json` records 5 consecutive fixed bench runs, aggregate steady TPOT avg `28.291-28.912ms`, and all 15 per-iteration hashes `6346f03343d75a65`; reviewer rerun `/tmp/pegainfer_dev_pr101_bench_{1..5}.json` observed aggregate steady TPOT avg `27.552965-29.755957ms`, again with all 15 hashes `6346f03343d75a65` | Achieved for the retained tree. |
-| Exact E2E remains `20/20` | `/tmp/dsv4_fresh_e2e_after_w2_reduce_doc.log` records `All 20 DeepSeek V4 exact cases passed` | Achieved for the retained tree. |
+| Fixed bench stable sub-30 with hash `6346f03343d75a65` | `$RESULT_ROOT/dsv4_stability_after_act_quant_revert_{1..5}.json` records 5 consecutive fixed bench runs, aggregate steady TPOT avg `28.291-28.912ms`, and all 15 per-iteration hashes `6346f03343d75a65`; reviewer rerun `$RESULT_ROOT/pegainfer_dev_pr101_bench_{1..5}.json` observed aggregate steady TPOT avg `27.552965-29.755957ms`, again with all 15 hashes `6346f03343d75a65` | Achieved for the retained tree. |
+| Exact E2E remains `20/20` | `$RESULT_ROOT/dsv4_fresh_e2e_after_w2_reduce_doc.log` records `All 20 DeepSeek V4 exact cases passed` | Achieved for the retained tree. |
 | Public vLLM/SGLang MoE decomposition is replicated first | Runtime uses routed FP4 `W13 grouped GEMM -> fused SwiGLU + W2 activation quant -> W2 grouped GEMM`; old split W1/W3/SwiGLU/W2 public and FFI paths are removed | Achieved. |
 | Deeper W13 accumulator -> SwiGLU -> W2-quant path is explored only after microbench/fuzz | TileLang W13 accumulator prototype was compiled after lowering fixes but failed the first active-expert fuzz shape, so it was removed before runtime integration | Explored and rejected; still open as a future true tensor-core epilogue project. |
 | Evidence chain records source anchor, decision, microbench, E2E, fixed bench, hash, TPOT band | The roadmap, baseline table, rejection sections, and evidence log below record retained and rejected MoE attempts. Temporary rejected bench sources were deleted after logging unless they remain as diagnostic microbench tools. | Sufficient for current retained/rejected attempts; continue adding entries for new attempts. |
@@ -97,7 +97,7 @@ Use this fixed decode bench for comparable DeepSeek V4 direct-runtime work:
 
 ```bash
 target/release/bench_serving \
-  --model-path /data/DeepSeek-V4-Flash \
+  --model-path $MODEL_DIR \
   --format json \
   request \
   --prompt-len 1 \
@@ -280,7 +280,7 @@ deepseek_apply_rope_q_kv_cuda(q, kv)
 fp8_act_quant_nope(kv)
 ```
 
-This does not fuse the KV no-PE FP8 quantization and does not specialize for decode `seq_len=1`. The grid covers `seq_len * (local_heads + 1) * rotary_pairs`, so prefill-shaped projection remains valid. The short nsys profile `/tmp/dsv4_qkv_rope_short.nsys-rep` shows `deepseek_apply_rope_q_kv_kernel` in the kernel summary; residual `deepseek_apply_rope_hidden_kernel` instances still come from compressor/indexer/final inverse RoPE paths.
+This does not fuse the KV no-PE FP8 quantization and does not specialize for decode `seq_len=1`. The grid covers `seq_len * (local_heads + 1) * rotary_pairs`, so prefill-shaped projection remains valid. The short nsys profile `$RESULT_ROOT/dsv4_qkv_rope_short.nsys-rep` shows `deepseek_apply_rope_q_kv_kernel` in the kernel summary; residual `deepseek_apply_rope_hidden_kernel` instances still come from compressor/indexer/final inverse RoPE paths.
 
 Validation on 5090:
 
@@ -406,7 +406,7 @@ OUT_DIR=$(find target/release/build/pegainfer-kernels-* -maxdepth 1 -type d -nam
   pegainfer-kernels/tools/deepseek_v4/w13_grouped_fp4_bench.cu \
   "$OUT_DIR/libkernels_cuda.a" \
   -lcudart \
-  -o /tmp/w13_grouped_fp4_bench
+  -o $RESULT_ROOT/w13_grouped_fp4_bench
 ```
 
 5090 microbench results:
@@ -456,10 +456,10 @@ Reference source positions:
 
 | Runtime | Source | Observed decode MoE shape |
 | --- | --- | --- |
-| vLLM | `/data/code/workspace-rustllm/vllm/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py` | `cutlass_fp4_moe_mm(c1, W13)` writes `gate||up`, then `silu_and_mul_scaled_fp4_experts_quant(c1, ...)`, then `cutlass_fp4_moe_mm(W2)`. MXFP4 uses the same split with `silu_and_mul_mxfp4_experts_quant`. |
-| vLLM C++ op registry | `/data/code/workspace-rustllm/vllm/csrc/libtorch_stable/torch_bindings.cpp` | Registers `silu_and_mul_scaled_fp4_experts_quant`, `silu_and_mul_mxfp4_experts_quant`, and grouped FP4/MXFP4 MoE GEMMs as separate ops. |
-| SGLang | `/data/code/workspace-rustllm/sglang/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py` | `grouped_gemm_nt_f8f8bf16_masked` writes `gateup_output`, then `sglang_per_token_group_quant_8bit(..., fuse_silu_and_mul=True)`, then W2 grouped GEMM. |
-| SGLang C++ quant | `/data/code/workspace-rustllm/sglang/sgl-kernel/csrc/gemm/per_token_group_quant_8bit_v2.cu` | The `fuse_silu_and_mul` path fuses activation with group quant, including masked expert layout. |
+| vLLM | `$LOCAL_WORKSPACE/vllm/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py` | `cutlass_fp4_moe_mm(c1, W13)` writes `gate||up`, then `silu_and_mul_scaled_fp4_experts_quant(c1, ...)`, then `cutlass_fp4_moe_mm(W2)`. MXFP4 uses the same split with `silu_and_mul_mxfp4_experts_quant`. |
+| vLLM C++ op registry | `$LOCAL_WORKSPACE/vllm/csrc/libtorch_stable/torch_bindings.cpp` | Registers `silu_and_mul_scaled_fp4_experts_quant`, `silu_and_mul_mxfp4_experts_quant`, and grouped FP4/MXFP4 MoE GEMMs as separate ops. |
+| SGLang | `$LOCAL_WORKSPACE/sglang/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py` | `grouped_gemm_nt_f8f8bf16_masked` writes `gateup_output`, then `sglang_per_token_group_quant_8bit(..., fuse_silu_and_mul=True)`, then W2 grouped GEMM. |
+| SGLang C++ quant | `$LOCAL_WORKSPACE/sglang/sgl-kernel/csrc/gemm/per_token_group_quant_8bit_v2.cu` | The `fuse_silu_and_mul` path fuses activation with group quant, including masked expert layout. |
 
 The next reusable lesson is their problem-size representation. vLLM builds `expert_offsets`, `blockscale_offsets`, `problem_sizes1`, and `problem_sizes2` before CUTLASS grouped GEMM. SGLang's masked path passes `masked_m` and `expected_m` into DeepGEMM. Both make the GEMM scheduler aware of per-expert logical M. PegaInfer currently has `expert_indptr`, but the TileLang grouped launch still uses `dim3 grid(out_tiles, ceil(rows / 32), local_experts)` and returns inside the kernel when `blockIdx.y * 32 >= expert_m`. That is correct and GPU-resident, but it still launches empty CTAs for short or empty experts.
 
@@ -780,7 +780,7 @@ A temporary hard-coded diagnostic at `start_pos == 80` synchronized the rank str
 
 ```bash
 target/release/bench_serving \
-  --model-path /data/DeepSeek-V4-Flash \
+  --model-path $MODEL_DIR \
   --format json \
   request \
   --prompt-len 1 \
@@ -790,7 +790,7 @@ target/release/bench_serving \
   --seed 42
 ```
 
-Route stats from `/tmp/dsv4_moe_route_stats.log` covered `43 layers * 8 ranks = 344` rows:
+Route stats from `$RESULT_ROOT/dsv4_moe_route_stats.log` covered `43 layers * 8 ranks = 344` rows:
 
 | Metric | Value |
 | --- | ---: |
@@ -819,7 +819,7 @@ Interpretation: the next plausible MoE win is not another scalar/row predicate i
 The W13 grouped FP4 bench now has an active-expert mode:
 
 ```bash
-/tmp/w13_grouped_fp4_bench \
+$RESULT_ROOT/w13_grouped_fp4_bench \
   --experts 32 \
   --active-experts 3 \
   --rows-per-active 8 \
@@ -840,7 +840,7 @@ W13 outputs are bitwise compared against the existing two-GEMM baseline. In acti
 The tool also supports arbitrary sparse counts, so active experts do not have to be a prefix:
 
 ```bash
-/tmp/w13_grouped_fp4_bench \
+$RESULT_ROOT/w13_grouped_fp4_bench \
   --counts 0,0,0,8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,8,0,0 \
   --capacity-launch-rows 8 \
   --compact-launch-rows 8 \
@@ -860,7 +860,7 @@ Interpretation: the current TileLang grouped W13/W2 early-return path already ma
 Follow-up probe: the same bench now supports `--compact-launch-rows`, which keeps the compact active expert pointer arrays but also uses a host-known per-expert row upper bound as the grouped GEMM launch `m`. This tests the vLLM/SGLang `problem_sizes` idea more directly:
 
 ```bash
-/tmp/w13_grouped_fp4_bench \
+$RESULT_ROOT/w13_grouped_fp4_bench \
   --experts 32 \
   --active-experts 8 \
   --rows-per-active 8 \
@@ -870,7 +870,7 @@ Follow-up probe: the same bench now supports `--compact-launch-rows`, which keep
   --iters 300
 ```
 
-5090 result log: `/tmp/dsv4_compact_launch_rows_bench.log`.
+5090 result log: `$RESULT_ROOT/dsv4_compact_launch_rows_bench.log`.
 
 | Active experts | Rows per active | Compact launch rows | Compact W13 | W13 speedup vs capacity | Compact W2 | W2 speedup vs capacity |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -883,7 +883,7 @@ Follow-up probe: the same bench now supports `--compact-launch-rows`, which keep
 
 The route-stat realistic probe uses active `1/2/5`, because the fixed decode trace had nonempty local experts avg `<1`, p95 `2`, and max `5`.
 
-5090 result log: `/tmp/dsv4_compact_launch_rows_realistic_bench.log`.
+5090 result log: `$RESULT_ROOT/dsv4_compact_launch_rows_realistic_bench.log`.
 
 | Active experts | Rows per active | Compact launch rows | Capacity W13 | Compact W13 | W13 speedup | Capacity W2 | Compact W2 | W2 speedup |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -895,7 +895,7 @@ Interpretation: compacting active experts is only useful when the launch also re
 
 Arbitrary-count follow-up: prefix-active experts had hidden a real cost. When active experts are sparse arbitrary ids, compacting the expert dimension and using a per-expert row bound becomes a clear microbench win:
 
-5090 logs: `/tmp/dsv4_arbitrary_counts_grouped_fp4_bench.log` and `/tmp/dsv4_arbitrary_counts_grouped_fp4_bound_bench.log`.
+5090 logs: `$RESULT_ROOT/dsv4_arbitrary_counts_grouped_fp4_bench.log` and `$RESULT_ROOT/dsv4_arbitrary_counts_grouped_fp4_bound_bench.log`.
 
 | Shape | Counts summary | Capacity launch rows | Capacity W13 | Compact W13 | W13 speedup | Capacity W2 | Compact W2 | W2 speedup |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1097,7 +1097,7 @@ Implementation notes:
 - The standalone benchmark compared the temporary TileLang kernel against the current C++ fused kernel, not the removed old split `deepseek_swiglu_clamp_cuda` path.
 - After the microbench, the temporary TileLang launcher was removed from the generator so there is no extra runtime-facing path.
 
-5090 result log: `/tmp/dsv4_tilelang_swiglu_quant_bench.log`.
+5090 result log: `$RESULT_ROOT/dsv4_tilelang_swiglu_quant_bench.log`.
 
 | Rows | Fuzz | Current C++ fused | TileLang candidate | Candidate / C++ |
 | ---: | --- | ---: | ---: | ---: |
@@ -1121,8 +1121,8 @@ grouped W13 FP4 GEMM accumulator
 
 The source idea is the same "experts can own activation/quant/finalize boundaries" direction from vLLM modular MoE and SGLang FlashInfer CuteDSL MoE:
 
-- `/data/code/workspace-rustllm/vllm/docs/design/fused_moe_modular_kernel.md`
-- `/data/code/workspace-rustllm/sglang/python/sglang/srt/layers/moe/flashinfer_cutedsl_moe.py`
+- `$LOCAL_WORKSPACE/vllm/docs/design/fused_moe_modular_kernel.md`
+- `$LOCAL_WORKSPACE/sglang/python/sglang/srt/layers/moe/flashinfer_cutedsl_moe.py`
 
 Implementation notes:
 
@@ -1138,7 +1138,7 @@ Implementation notes:
 | release `cargo check -p pegainfer-deepseek-v4 --features deepseek-v4` | passed locally and on 5090 after generator fixes |
 | microbench first fuzz shape | active `1`, rows/active `8`, experts `32` |
 | fuzz result | FAIL: FP8 activation and E8M0 scale bytes differed from the current baseline |
-| log | `/tmp/dsv4_w13_swiglu_quant_bench.log` |
+| log | `$RESULT_ROOT/dsv4_w13_swiglu_quant_bench.log` |
 
 Drop decision: do not retain. The generator can express the rough shape, but it did not reproduce the current C++ SwiGLU+E8M0/FP8 quant bytes. That would change the fixed long token trace, so this is not a runtime candidate. The temporary generated launcher and C++ bench source were removed locally and on 5090; the retained generator surface is back to grouped FP4 `block_M=32` with `32768` dynamic shared bytes.
 
@@ -1168,7 +1168,7 @@ Earlier exploratory runs of the same BF16 direct shape landed at `26.194ms`, `30
 
 Rejected variant: caching score-gate weights as F32 preserved exact E2E and token hash, but the fixed bench regressed to aggregate steady TPOT avg `29.148ms` with per-iteration `29.152ms`, `29.139ms`, and `29.155ms`. The extra F32 memory footprint and F32 math path were not worth keeping.
 
-Rejected variant: direct CUDA BF16 router projection. SGLang has a `fused_moe_router_cudacore` route in `/data/code/workspace-rustllm/sglang/python/sglang/srt/layers/moe/router.py`, and TileKernels has warp-level top-k/scoring kernels under `/data/code/workspace-rustllm/TileKernels/tile_kernels/moe/`. We tested the analogous PegaInfer idea with a temporary standalone bench: keep the existing select/normalization semantics, but replace the cuBLAS BF16 projection with a direct CUDA dot-product kernel over `(seq_len, n_experts, hidden_dim)`. The bench source was deleted after rejection so it cannot be accidentally wired into runtime.
+Rejected variant: direct CUDA BF16 router projection. SGLang has a `fused_moe_router_cudacore` route in `$LOCAL_WORKSPACE/sglang/python/sglang/srt/layers/moe/router.py`, and TileKernels has warp-level top-k/scoring kernels under `$LOCAL_WORKSPACE/TileKernels/tile_kernels/moe/`. We tested the analogous PegaInfer idea with a temporary standalone bench: keep the existing select/normalization semantics, but replace the cuBLAS BF16 projection with a direct CUDA dot-product kernel over `(seq_len, n_experts, hidden_dim)`. The bench source was deleted after rejection so it cannot be accidentally wired into runtime.
 
 5090 microbench:
 
@@ -1198,8 +1198,8 @@ Drop decision: do not retain. Even though exact E2E passed and the fixed bench g
 
 vLLM's modular MoE design explicitly allows `TopKWeightAndReduce` to live inside `FusedMoEExpertsModular::apply()` rather than in the prepare/finalize layer. Relevant source/doc anchors:
 
-- `/data/code/workspace-rustllm/vllm/docs/design/fused_moe_modular_kernel.md` — `TopKWeightAndReduce` and `finalize_weight_and_reduce_impl`.
-- `/data/code/workspace-rustllm/vllm/vllm/model_executor/layers/fused_moe/modular_kernel.py` — abstract interfaces for prepare/finalize, experts, and top-k weight/reduce.
+- `$LOCAL_WORKSPACE/vllm/docs/design/fused_moe_modular_kernel.md` — `TopKWeightAndReduce` and `finalize_weight_and_reduce_impl`.
+- `$LOCAL_WORKSPACE/vllm/vllm/model_executor/layers/fused_moe/modular_kernel.py` — abstract interfaces for prepare/finalize, experts, and top-k weight/reduce.
 
 The idea maps to our current routed W2 boundary as:
 
@@ -1215,13 +1215,13 @@ candidate:
 The issue is layout. Our W2 grouped GEMM is expert-major and route-row-major, while the current reduce kernel is token-major and deterministic over `topk`. A direct W2 epilogue combine would need either atomics into per-token output or a different output layout/scheduler. A standalone microbench tested the atomic version before touching runtime:
 
 ```bash
-/tmp/w2_weighted_reduce_bench 1 6 4096 1000 42
-/tmp/w2_weighted_reduce_bench 8 6 4096 1000 42
-/tmp/w2_weighted_reduce_bench 16 6 4096 1000 42
-/tmp/w2_weighted_reduce_bench 32 6 4096 1000 42
+$RESULT_ROOT/w2_weighted_reduce_bench 1 6 4096 1000 42
+$RESULT_ROOT/w2_weighted_reduce_bench 8 6 4096 1000 42
+$RESULT_ROOT/w2_weighted_reduce_bench 16 6 4096 1000 42
+$RESULT_ROOT/w2_weighted_reduce_bench 32 6 4096 1000 42
 ```
 
-5090 result log: `/tmp/dsv4_w2_weighted_reduce_bench.log`.
+5090 result log: `$RESULT_ROOT/dsv4_w2_weighted_reduce_bench.log`.
 
 | `seq_len` | Current deterministic reduce | Atomic epilogue-shaped reduce | Atomic / current | Max abs diff |
 | ---: | ---: | ---: | ---: | ---: |
@@ -1236,9 +1236,9 @@ Drop decision: do not integrate. The numerical difference is small, but the atom
 
 vLLM and FlashInfer/TRTLLM paths often reshape W13 to match the fused SwiGLU convention. Relevant source anchors:
 
-- `/data/code/workspace-rustllm/vllm/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py` — TRTLLM MXFP4 path swaps/interleaves W1/W3 to match its SwiGLU convention.
-- `/data/code/workspace-rustllm/vllm/vllm/model_executor/layers/quantization/utils/flashinfer_utils.py` — FlashInfer utility comments note the expected `[up; gate]` convention.
-- `/data/code/workspace-rustllm/sglang/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutedsl.py` — CuteDSL runner has an explicit W13 interleave helper.
+- `$LOCAL_WORKSPACE/vllm/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py` — TRTLLM MXFP4 path swaps/interleaves W1/W3 to match its SwiGLU convention.
+- `$LOCAL_WORKSPACE/vllm/vllm/model_executor/layers/quantization/utils/flashinfer_utils.py` — FlashInfer utility comments note the expected `[up; gate]` convention.
+- `$LOCAL_WORKSPACE/sglang/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutedsl.py` — CuteDSL runner has an explicit W13 interleave helper.
 
 Our current retained routed local expert layout is simpler:
 
@@ -1253,12 +1253,12 @@ The candidate was to write W13 as one pair-interleaved BF16 buffer, with adjacen
 Standalone microbench:
 
 ```bash
-/tmp/swiglu_layout_bench 48 5000 45 7.0
-/tmp/swiglu_layout_bench 64 5000 42 7.0
-/tmp/swiglu_layout_bench 96 5000 46 7.0
-/tmp/swiglu_layout_bench 128 5000 43 7.0
-/tmp/swiglu_layout_bench 192 3000 47 7.0
-/tmp/swiglu_layout_bench 256 3000 44 7.0
+$RESULT_ROOT/swiglu_layout_bench 48 5000 45 7.0
+$RESULT_ROOT/swiglu_layout_bench 64 5000 42 7.0
+$RESULT_ROOT/swiglu_layout_bench 96 5000 46 7.0
+$RESULT_ROOT/swiglu_layout_bench 128 5000 43 7.0
+$RESULT_ROOT/swiglu_layout_bench 192 3000 47 7.0
+$RESULT_ROOT/swiglu_layout_bench 256 3000 44 7.0
 ```
 
 5090 results:
@@ -1294,7 +1294,7 @@ final routed + shared add
 
 The first CUDA-event version failed on 5090 with `CUDA_ERROR_INVALID_HANDLE` when timed events were mixed across the compute stream and MoE NCCL stream. The working trace used host-side synchronization after each stage. That intentionally perturbs overlap and should not be compared as TPOT; it is only a stage-ranking diagnostic. The fixed bench still preserved token hash `6346f03343d75a65`.
 
-Trace log: `/tmp/dsv4_moe_stage_trace_bench.log`.
+Trace log: `$RESULT_ROOT/dsv4_moe_stage_trace_bench.log`.
 
 The log contains three `start_pos == 80` occurrences (`warmup=2`, `iters=1`), each with `43 layers * 8 ranks`. Aggregating by taking the slowest rank per layer gives the following approximate per-token sums:
 
@@ -1372,7 +1372,7 @@ Trace summary across the 5 traced requests (`2` warmup + `3` measured), aggregat
 
 Interpretation: the current shared/routed MoE path is not the largest source of rank skew in this trace. MoE is still a large absolute cost, but its rank range is only about `0.6ms`; the larger variance comes from attention local and attention collective+HC-post windows. The next optimization pass should not blindly keep fusing MoE kernels before explaining attention-local variability.
 
-A narrower per-layer trace at the same hard-coded `start_pos == 80` logged `43 layers * 8 ranks * 5 requests = 1720` rows in `/tmp/dsv4_layer_trace_bench.log`. The fixed bench stayed on the same token trace (`6346f03343d75a65`) and measured around `30.84ms/token`, but this run included per-layer stream synchronizations and is attribution-only.
+A narrower per-layer trace at the same hard-coded `start_pos == 80` logged `43 layers * 8 ranks * 5 requests = 1720` rows in `$RESULT_ROOT/dsv4_layer_trace_bench.log`. The fixed bench stayed on the same token trace (`6346f03343d75a65`) and measured around `30.84ms/token`, but this run included per-layer stream synchronizations and is attribution-only.
 
 | Stage | Avg per layer | Approx 43-layer sum | p95 per layer | Max per layer |
 | --- | ---: | ---: | ---: | ---: |
@@ -1389,9 +1389,9 @@ A later short full-process nsys run on the current retained code used:
 
 ```bash
 nsys profile --force-overwrite=true -t cuda,nvtx \
-  -o /tmp/dsv4_current_short \
+  -o $RESULT_ROOT/dsv4_current_short \
   target/release/bench_serving \
-    --model-path /data/DeepSeek-V4-Flash \
+    --model-path $MODEL_DIR \
     --format json \
     request \
     --prompt-len 1 \
@@ -1421,7 +1421,7 @@ The profile is attribution-only, but it confirms why the last MoE microbench win
 
 Interpretation: after the retained W13/SwiGLU/W2 path, the next real sub-25 work should not be another standalone activation/quant kernel swap. Either change the actual W13/W2 grouped GEMM scheduler/epilogue, or move to the larger attention/HC/dense-GEMV sections. NCCL rows stay wait-inclusive and should be paired with rank-arrival evidence before optimizing collectives.
 
-After retaining MoE all-gather/reduce-scatter shared overlap, a fresh short profile `/tmp/dsv4_ag_overlap_short.nsys-rep` showed the new shape. The profile itself perturbed TPOT to `34.49ms/token`, so use only the kernel distribution:
+After retaining MoE all-gather/reduce-scatter shared overlap, a fresh short profile `$RESULT_ROOT/dsv4_ag_overlap_short.nsys-rep` showed the new shape. The profile itself perturbed TPOT to `34.49ms/token`, so use only the kernel distribution:
 
 | Kernel bucket | Total GPU time share | Notes |
 | --- | ---: | --- |
@@ -1435,7 +1435,7 @@ After retaining MoE all-gather/reduce-scatter shared overlap, a fresh short prof
 
 The follow-up split experiment tried to run shared W13 during all-gather and shared W2 during reduce-scatter. It was exact and hash-stable, but repeated fixed benches were `26.625ms` and `27.145ms`, not better than the simpler retained all-gather overlap. Keep the simpler schedule unless a future profile proves a different stream split is needed.
 
-A post-`32768` grouped-FP4 shared-memory short profile `/tmp/dsv4_shared32768_short.nsys-rep` used the same `--output-len 32 --warmup 1 --iters 1 --seed 42` attribution workflow. The short run's 32-token hash was `5f6c64b667f2abf5`; it shares the same prefix as the fixed 160-token trace, but the hash is naturally different because the sequence length is different. The profile perturbed steady TPOT to `30.64ms/token`, so use the table only for composition:
+A post-`32768` grouped-FP4 shared-memory short profile `$RESULT_ROOT/dsv4_shared32768_short.nsys-rep` used the same `--output-len 32 --warmup 1 --iters 1 --seed 42` attribution workflow. The short run's 32-token hash was `5f6c64b667f2abf5`; it shares the same prefix as the fixed 160-token trace, but the hash is naturally different because the sequence length is different. The profile perturbed steady TPOT to `30.64ms/token`, so use the table only for composition:
 
 | Kernel row | Share | Notes |
 | --- | ---: | --- |
@@ -1458,7 +1458,7 @@ A careful decode-mid profile on 2026-05-13 used a fixed-bench calibration first,
 
 ```bash
 target/release/bench_serving \
-  --model-path /data/DeepSeek-V4-Flash \
+  --model-path $MODEL_DIR \
   --format json \
   request \
   --prompt-len 1 \
@@ -1474,9 +1474,9 @@ nsys profile --force-overwrite=true \
   --cuda-event-trace=false \
   --delay=37 \
   --duration=4 \
-  -o /tmp/dsv4_profile_decode_mid \
+  -o $RESULT_ROOT/dsv4_profile_decode_mid \
   target/release/bench_serving \
-    --model-path /data/DeepSeek-V4-Flash \
+    --model-path $MODEL_DIR \
     --format json \
     request \
     --prompt-len 1 \
@@ -1486,14 +1486,14 @@ nsys profile --force-overwrite=true \
     --seed 42
 ```
 
-The calibration JSON `/tmp/dsv4_profile_calibration_20260513_101406.json` had steady TPOT avg `28.347ms`, p50 `28.122ms`, p95 `29.653ms`, and all three generated-token hashes `6346f03343d75a65`. The delayed profile JSON `/tmp/dsv4_profile_decode_mid.json` kept the same 160-token hash and reported steady TPOT avg `29.222ms`; use the delayed profile for kernel composition only. The first attempted `--trace=nccl` failed because Nsight Systems 2025.1.3 on 5090 does not support `nccl` as a trace selector; NCCL is therefore identified by CUDA kernel names.
+The calibration JSON `$RESULT_ROOT/dsv4_profile_calibration_20260513_101406.json` had steady TPOT avg `28.347ms`, p50 `28.122ms`, p95 `29.653ms`, and all three generated-token hashes `6346f03343d75a65`. The delayed profile JSON `$RESULT_ROOT/dsv4_profile_decode_mid.json` kept the same 160-token hash and reported steady TPOT avg `29.222ms`; use the delayed profile for kernel composition only. The first attempted `--trace=nccl` failed because Nsight Systems 2025.1.3 on 5090 does not support `nccl` as a trace selector; NCCL is therefore identified by CUDA kernel names.
 
 Nsight output files:
 
-- `/tmp/dsv4_profile_decode_mid.nsys-rep`
-- `/tmp/dsv4_profile_decode_mid.sqlite`
-- `/tmp/dsv4_profile_decode_mid_stats_cuda_gpu_kern_sum.csv`
-- `/tmp/dsv4_profile_decode_mid_stats_cuda_api_sum.csv`
+- `$RESULT_ROOT/dsv4_profile_decode_mid.nsys-rep`
+- `$RESULT_ROOT/dsv4_profile_decode_mid.sqlite`
+- `$RESULT_ROOT/dsv4_profile_decode_mid_stats_cuda_gpu_kern_sum.csv`
+- `$RESULT_ROOT/dsv4_profile_decode_mid_stats_cuda_api_sum.csv`
 
 The W13 instance count implies the delayed window captured about `94` steady decode steps: `32285 / (8 ranks * 43 layers) = 93.85`. The table below is aggregate GPU time across all 8 ranks in that capture window, not per-token wall time:
 
@@ -1604,7 +1604,7 @@ This refines the earlier active-expert conclusion: empty grouped-GEMM launches a
 
 Interpretation for the next patch: do not chase another isolated SwiGLU/quant or route-mapping microkernel. The remaining plausible sub-25 levers are either a real grouped W13/W2 scheduler/epilogue change that moves the `15.3%` routed expert GEMM bucket, or a batch-general reduction of HC/attention local launch clusters and the arrival skew that feeds the wait-inclusive collective windows.
 
-A temporary hard-coded `start_pos == 80` trace was rerun after retaining MoE all-gather overlap. The trace synchronized rank streams and is attribution-only; fixed bench token hashes stayed `6346f03343d75a65`, but timing was perturbed by logging/synchronization. The log is `/tmp/dsv4_trace_current_bench.log`.
+A temporary hard-coded `start_pos == 80` trace was rerun after retaining MoE all-gather overlap. The trace synchronized rank streams and is attribution-only; fixed bench token hashes stayed `6346f03343d75a65`, but timing was perturbed by logging/synchronization. The log is `$RESULT_ROOT/dsv4_trace_current_bench.log`.
 
 Excluding the first traced layer-0 MoE warmup outlier, the broad per-layer shape was:
 
@@ -1716,9 +1716,9 @@ Standalone tool:
   -std=c++17 \
   -arch=sm_120 \
   pegainfer-kernels/tools/deepseek_v4/score_select_bench.cu \
-  -o /tmp/dsv4_score_select_bench
+  -o $RESULT_ROOT/dsv4_score_select_bench
 
-/tmp/dsv4_score_select_bench
+$RESULT_ROOT/dsv4_score_select_bench
 ```
 
 Microbench result on 5090:
@@ -1825,7 +1825,7 @@ Verified command set for this PR:
 cargo fmt --check
 cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
 cargo check --release -p pegainfer-server --features deepseek-v4
-gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl
+gcc -shared -fPIC -O2 -Wall -Wextra -o $RESULT_ROOT/cuda_api_counter.so tools/cuda_api_counter.c -ldl
 ```
 
 ## Validation
@@ -1835,8 +1835,8 @@ Local:
 - `cargo fmt --check`
 - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4`
 - `cargo check --release -p pegainfer-server --features deepseek-v4`
-- `gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
-- `nm -D /tmp/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
+- `gcc -shared -fPIC -O2 -Wall -Wextra -o $RESULT_ROOT/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
+- `nm -D $RESULT_ROOT/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 - `git diff --check`
 - pre-commit hooks on commit, including clippy
 
@@ -1846,103 +1846,103 @@ Local:
 - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4`
 - `cargo check --release -p pegainfer-server --features deepseek-v4`
 - release `deepseek_v4_e2e`: `All 20 DeepSeek V4 exact cases passed`
-- release fixed bench log `/tmp/dsv4_pr_driver_numa_bench.log`: steady TPOT avg `35.253ms`, p50 `34.800ms`, p95 `37.335ms`, first decode avg `33.743ms`, hash `6346f03343d75a65`
-- current clean fixed bench log `/tmp/dsv4_clean_tpot_now.log`: per-iteration steady TPOT avg `29.944ms`, `29.907ms`, `29.896ms`, all hash `6346f03343d75a65`
-- current exact E2E log `/tmp/dsv4_e2e_current.log`: `All 20 DeepSeek V4 exact cases passed`
-- fused-clear exact E2E log `/tmp/dsv4_clear_fused_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- fused-clear fixed bench log `/tmp/dsv4_clear_fused_bench.log`: per-iteration steady TPOT avg `29.862ms`, `29.969ms`, `29.874ms`, all hash `6346f03343d75a65`
-- fused-clear short nsys log `/tmp/dsv4_clear_fused_short_profile.txt`: `deepseek_moe_clear_mapping_kernel` replaces the old repeated clear kernel
-- small-route exact E2E log `/tmp/dsv4_small_mapping_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- small-route fixed bench logs `/tmp/dsv4_small_mapping_bench.log` and `/tmp/dsv4_small_mapping_bench_repeat.log`: per-iteration steady TPOT avg `27.608ms`, `27.662ms`, `27.826ms`, then `27.698ms`, `27.693ms`, `27.644ms`; all hash `6346f03343d75a65`
-- small-route short nsys log `/tmp/dsv4_small_mapping_short_profile.txt`: `deepseek_moe_local_mapping_small_kernel` is the decode-sized route mapping path
-- rejected route-W13 exact E2E log `/tmp/dsv4_route_w13_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected route-W13 fixed bench log `/tmp/dsv4_route_w13_bench.log`: aggregate steady TPOT avg `33.217ms`, per-iteration `33.162ms`, `33.355ms`, `33.135ms`; all hash `6346f03343d75a65`
-- rejected expand+act_quant exact E2E log `/tmp/dsv4_expand_act_quant_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected expand+act_quant fixed bench logs `/tmp/dsv4_expand_act_quant_bench.log` and `/tmp/dsv4_expand_act_quant_bench_repeat.log`: per-iteration steady TPOT avg `28.080ms`, `28.143ms`, `27.198ms`, then `28.509ms`, `28.712ms`, `28.474ms`; all hash `6346f03343d75a65`
-- rejected W2 valid-row exact E2E log `/tmp/dsv4_valid_rows_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected W2 valid-row fixed bench log `/tmp/dsv4_valid_rows_bench.log`: aggregate steady TPOT avg `31.270ms`, per-iteration `31.220ms`, `31.342ms`, `31.248ms`; all hash `6346f03343d75a65`
-- rejected grouped GEMM row-tile upper-bound exact E2E log `/tmp/dsv4_max_expert_rows_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected grouped GEMM row-tile upper-bound fixed bench log `/tmp/dsv4_max_expert_rows_bench.log`: per-iteration steady TPOT avg `28.504ms`, `28.460ms`, `28.735ms`; all hash `6346f03343d75a65`
-- active-expert W13/W2 compact-pointer microbench on 5090: `/tmp/w13_grouped_fp4_bench --experts 32 --active-experts {1,3,6} --rows-per-active 8`; bitwise PASS, W13 compact speedup `0.999x`, `1.009x`, `1.000x`, W2 compact speedup `1.000x`, `1.000x`, `1.000x`
-- accumulator-direct SwiGLU quant upper-bound microbench on 5090: `/tmp/swiglu_quant_bench --rows {48,96,192}`; bitwise PASS, materialized/direct deltas `0.002255ms`, `0.000589ms`, `0.002048ms`
-- rejected standalone TileLang SwiGLU quant log `/tmp/dsv4_tilelang_swiglu_quant_bench.log`: byte-identical to current C++ fused SwiGLU+FP8 quant, but rows `48/96/192` measured `0.388x`, `0.653x`, and `0.998x` of the current C++ fused kernel. The generated launcher was removed after the probe.
-- rejected TileLang W13 accumulator-to-SwiGLU-quant prototype log `/tmp/dsv4_w13_swiglu_quant_bench.log`: the temporary generated kernel compiled after fixing shared-buffer pipeline planning and amax reduction shape, but the first active-expert fuzz shape failed byte comparison against current `grouped_w13_gemm -> C++ fused SwiGLU+FP8 quant`; the generated launcher and C++ bench were removed.
-- current retained fixed bench log `/tmp/dsv4_current_retained_bench.log`: per-iteration steady TPOT avg `28.940ms`, `28.942ms`, `28.913ms`; all hash `6346f03343d75a65`
-- current retained short profile `/tmp/dsv4_current_short.nsys-rep` and kernel summary `/tmp/dsv4_current_short_kernels_cuda_gpu_kern_sum.csv`: routed SwiGLU+quant only `0.64%`, routed W13/W2 grouped FP4 together `11.32%`, and wait-inclusive NCCL rows remain the largest apparent rows.
-- rejected HC direct mixes exact E2E log `/tmp/dsv4_hc_direct_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected HC direct mixes fixed bench log `/tmp/dsv4_hc_direct_bench.log`: aggregate steady TPOT avg `28.555ms`, per-iteration `28.480ms`, `28.496ms`, `28.690ms`; hash changed to `0e73c031774b6142`
-- post-revert HC fixed bench log `/tmp/dsv4_hc_reverted_bench.log`: aggregate steady TPOT avg `28.327ms`, per-iteration `28.312ms`, `28.391ms`, `28.277ms`; all hash `6346f03343d75a65`
-- rejected HC mixes unified `GemmEx` exact E2E log `/tmp/dsv4_hc_gemmex_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected HC mixes unified `GemmEx` fixed bench log `/tmp/dsv4_hc_gemmex_bench.json`: aggregate steady TPOT avg `29.745ms`, per-iteration `29.881ms`, `29.668ms`, `29.686ms`; all hash `6346f03343d75a65`. The runtime branch was reverted and 5090 release binaries were rebuilt back to the retained HC GEMV/GemmEx split.
-- rejected HC pre-scaled input exact E2E log `/tmp/dsv4_hc_prescale_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected HC pre-scaled input fixed bench log `/tmp/dsv4_hc_prescale_bench.json`: aggregate steady TPOT avg `28.404ms`, per-iteration `28.392ms`, `28.402ms`, `28.419ms`; all generated-token hashes changed to `3ed2ed5c96344f69`
-- post-revert HC pre-scaled input fixed bench log `/tmp/dsv4_hc_prescale_reverted_bench.json`: aggregate steady TPOT avg `29.181ms`, per-iteration `29.260ms`, `29.456ms`, `28.828ms`; all hashes restored to `6346f03343d75a65`
-- rejected dense FP8 shared-memory downsize exact E2E log `/tmp/dsv4_fp8_shared32768_e2e.log`: failed case 0 with `CUDA_ERROR_ILLEGAL_ADDRESS` at `prefill layer 0 rank 0`
-- post-revert dense FP8 shared-memory downsize exact E2E log `/tmp/dsv4_fp8_shared32768_reverted_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- post-revert dense FP8 shared-memory downsize fixed bench log `/tmp/dsv4_fp8_shared32768_reverted_bench.json`: aggregate steady TPOT avg `28.739ms`, per-iteration `28.552ms`, `28.899ms`, `28.766ms`; all hashes restored to `6346f03343d75a65`
-- retained parallel score-select microbench log `/tmp/dsv4_score_select_bench.log`: serial vs parallel top-k select is bitwise identical for `seq_len={1,8,16,32}` with speedup about `1.50x`
-- retained parallel score-select exact E2E log `/tmp/dsv4_score_select_parallel_retained_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- retained parallel score-select fixed bench log `/tmp/dsv4_score_select_parallel_retained_bench.json`: aggregate steady TPOT avg `28.458ms`, per-iteration `28.343ms`, `28.468ms`, `28.562ms`; all hashes `6346f03343d75a65`
-- rejected hand routed W13 act_quant microbench log `/tmp/dsv4_act_quant_bench.log`: hand CUDA act_quant was bitwise-identical to TileLang for `hidden_dim={4096,2048}` and `rows={8,48,96}`, with `2.0-3.0x` standalone speedup.
-- rejected hand routed W13 act_quant exact E2E log `/tmp/dsv4_hand_act_quant_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected hand routed W13 act_quant fixed bench log `/tmp/dsv4_hand_act_quant_bench.json`: aggregate steady TPOT avg `28.802ms`, per-iteration `29.014ms`, `28.744ms`, `28.647ms`; all hashes `6346f03343d75a65`
-- post-revert hand act_quant exact E2E log `/tmp/dsv4_act_quant_restored_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- post-revert hand act_quant fixed bench logs `/tmp/dsv4_act_quant_restored_bench.json` and `/tmp/dsv4_act_quant_restored_bench_repeat.json`: first run aggregate steady TPOT avg `28.249ms` but one iteration hash changed to `a278a8140c25b812`; repeat aggregate steady TPOT avg `29.277ms`, per-iteration `29.265ms`, `29.272ms`, `29.293ms`, with all hashes restored to `6346f03343d75a65`
-- post-revert hand act_quant 5-run stability logs `/tmp/dsv4_stability_after_act_quant_revert_{1..5}.json`: aggregate steady TPOT avg `28.912ms`, `28.867ms`, `28.291ms`, `28.375ms`, and `28.715ms`; all 15 per-iteration hashes were `6346f03343d75a65`. Another CPU load was running during this sweep, so the result is a conservative sub-30 stability check rather than a clean machine best-band.
-- reviewer 5090 5-run stability rerun `/tmp/pegainfer_dev_pr101_bench_{1..5}.json`: aggregate steady TPOT avg `28.505793ms`, `28.087102ms`, `29.755957ms`, `27.552965ms`, and `29.371630ms`; all 15 per-iteration hashes were `6346f03343d75a65`. One run wrote the complete JSON report and logged scheduler exit, then segfaulted in NCCL shutdown; treat that as the existing shutdown cleanup issue, not decode TPOT or token-correctness evidence.
-- fused Q/KV RoPE exact E2E log `/tmp/dsv4_qkv_rope_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- fused Q/KV RoPE fixed bench logs `/tmp/dsv4_qkv_rope_bench.log` and `/tmp/dsv4_qkv_rope_bench_repeat.log`: per-iteration steady TPOT avg `28.215ms`, `28.256ms`, `28.236ms`, then `27.096ms`, `28.565ms`, `28.349ms`; all hash `6346f03343d75a65`
-- fused Q/KV RoPE short profile `/tmp/dsv4_qkv_rope_short.nsys-rep` and `/tmp/dsv4_qkv_rope_short_kernels_cuda_gpu_kern_sum.csv`: `deepseek_apply_rope_q_kv_kernel` appears in the kernel summary; residual hidden-RoPE kernels are from non-projection paths.
-- rejected Q/KV RoPE+KV quant exact E2E log `/tmp/dsv4_qkv_rope_quant_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected Q/KV RoPE+KV quant fixed bench log `/tmp/dsv4_qkv_rope_quant_bench.log`: aggregate steady TPOT avg `29.948ms`, per-iteration `29.885ms`, `29.910ms`, `30.048ms`; all hash `6346f03343d75a65`
-- rejected ratio-4 top-k concat removal exact E2E log `/tmp/dsv4_topk_no_concat_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected ratio-4 top-k concat removal fixed bench log `/tmp/dsv4_topk_no_concat_bench.log`: aggregate steady TPOT avg `29.541ms`, per-iteration `29.551ms`, `29.539ms`, `29.532ms`; all hash `6346f03343d75a65`
-- post-revert ratio-4 top-k fixed bench log `/tmp/dsv4_revert_topk_bench.log`: aggregate steady TPOT avg `28.333ms`, per-iteration `28.316ms`, `28.336ms`, `28.346ms`; all hash `6346f03343d75a65`
+- release fixed bench log `$RESULT_ROOT/dsv4_pr_driver_numa_bench.log`: steady TPOT avg `35.253ms`, p50 `34.800ms`, p95 `37.335ms`, first decode avg `33.743ms`, hash `6346f03343d75a65`
+- current clean fixed bench log `$RESULT_ROOT/dsv4_clean_tpot_now.log`: per-iteration steady TPOT avg `29.944ms`, `29.907ms`, `29.896ms`, all hash `6346f03343d75a65`
+- current exact E2E log `$RESULT_ROOT/dsv4_e2e_current.log`: `All 20 DeepSeek V4 exact cases passed`
+- fused-clear exact E2E log `$RESULT_ROOT/dsv4_clear_fused_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- fused-clear fixed bench log `$RESULT_ROOT/dsv4_clear_fused_bench.log`: per-iteration steady TPOT avg `29.862ms`, `29.969ms`, `29.874ms`, all hash `6346f03343d75a65`
+- fused-clear short nsys log `$RESULT_ROOT/dsv4_clear_fused_short_profile.txt`: `deepseek_moe_clear_mapping_kernel` replaces the old repeated clear kernel
+- small-route exact E2E log `$RESULT_ROOT/dsv4_small_mapping_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- small-route fixed bench logs `$RESULT_ROOT/dsv4_small_mapping_bench.log` and `$RESULT_ROOT/dsv4_small_mapping_bench_repeat.log`: per-iteration steady TPOT avg `27.608ms`, `27.662ms`, `27.826ms`, then `27.698ms`, `27.693ms`, `27.644ms`; all hash `6346f03343d75a65`
+- small-route short nsys log `$RESULT_ROOT/dsv4_small_mapping_short_profile.txt`: `deepseek_moe_local_mapping_small_kernel` is the decode-sized route mapping path
+- rejected route-W13 exact E2E log `$RESULT_ROOT/dsv4_route_w13_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected route-W13 fixed bench log `$RESULT_ROOT/dsv4_route_w13_bench.log`: aggregate steady TPOT avg `33.217ms`, per-iteration `33.162ms`, `33.355ms`, `33.135ms`; all hash `6346f03343d75a65`
+- rejected expand+act_quant exact E2E log `$RESULT_ROOT/dsv4_expand_act_quant_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected expand+act_quant fixed bench logs `$RESULT_ROOT/dsv4_expand_act_quant_bench.log` and `$RESULT_ROOT/dsv4_expand_act_quant_bench_repeat.log`: per-iteration steady TPOT avg `28.080ms`, `28.143ms`, `27.198ms`, then `28.509ms`, `28.712ms`, `28.474ms`; all hash `6346f03343d75a65`
+- rejected W2 valid-row exact E2E log `$RESULT_ROOT/dsv4_valid_rows_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected W2 valid-row fixed bench log `$RESULT_ROOT/dsv4_valid_rows_bench.log`: aggregate steady TPOT avg `31.270ms`, per-iteration `31.220ms`, `31.342ms`, `31.248ms`; all hash `6346f03343d75a65`
+- rejected grouped GEMM row-tile upper-bound exact E2E log `$RESULT_ROOT/dsv4_max_expert_rows_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected grouped GEMM row-tile upper-bound fixed bench log `$RESULT_ROOT/dsv4_max_expert_rows_bench.log`: per-iteration steady TPOT avg `28.504ms`, `28.460ms`, `28.735ms`; all hash `6346f03343d75a65`
+- active-expert W13/W2 compact-pointer microbench on 5090: `$RESULT_ROOT/w13_grouped_fp4_bench --experts 32 --active-experts {1,3,6} --rows-per-active 8`; bitwise PASS, W13 compact speedup `0.999x`, `1.009x`, `1.000x`, W2 compact speedup `1.000x`, `1.000x`, `1.000x`
+- accumulator-direct SwiGLU quant upper-bound microbench on 5090: `$RESULT_ROOT/swiglu_quant_bench --rows {48,96,192}`; bitwise PASS, materialized/direct deltas `0.002255ms`, `0.000589ms`, `0.002048ms`
+- rejected standalone TileLang SwiGLU quant log `$RESULT_ROOT/dsv4_tilelang_swiglu_quant_bench.log`: byte-identical to current C++ fused SwiGLU+FP8 quant, but rows `48/96/192` measured `0.388x`, `0.653x`, and `0.998x` of the current C++ fused kernel. The generated launcher was removed after the probe.
+- rejected TileLang W13 accumulator-to-SwiGLU-quant prototype log `$RESULT_ROOT/dsv4_w13_swiglu_quant_bench.log`: the temporary generated kernel compiled after fixing shared-buffer pipeline planning and amax reduction shape, but the first active-expert fuzz shape failed byte comparison against current `grouped_w13_gemm -> C++ fused SwiGLU+FP8 quant`; the generated launcher and C++ bench were removed.
+- current retained fixed bench log `$RESULT_ROOT/dsv4_current_retained_bench.log`: per-iteration steady TPOT avg `28.940ms`, `28.942ms`, `28.913ms`; all hash `6346f03343d75a65`
+- current retained short profile `$RESULT_ROOT/dsv4_current_short.nsys-rep` and kernel summary `$RESULT_ROOT/dsv4_current_short_kernels_cuda_gpu_kern_sum.csv`: routed SwiGLU+quant only `0.64%`, routed W13/W2 grouped FP4 together `11.32%`, and wait-inclusive NCCL rows remain the largest apparent rows.
+- rejected HC direct mixes exact E2E log `$RESULT_ROOT/dsv4_hc_direct_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected HC direct mixes fixed bench log `$RESULT_ROOT/dsv4_hc_direct_bench.log`: aggregate steady TPOT avg `28.555ms`, per-iteration `28.480ms`, `28.496ms`, `28.690ms`; hash changed to `0e73c031774b6142`
+- post-revert HC fixed bench log `$RESULT_ROOT/dsv4_hc_reverted_bench.log`: aggregate steady TPOT avg `28.327ms`, per-iteration `28.312ms`, `28.391ms`, `28.277ms`; all hash `6346f03343d75a65`
+- rejected HC mixes unified `GemmEx` exact E2E log `$RESULT_ROOT/dsv4_hc_gemmex_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected HC mixes unified `GemmEx` fixed bench log `$RESULT_ROOT/dsv4_hc_gemmex_bench.json`: aggregate steady TPOT avg `29.745ms`, per-iteration `29.881ms`, `29.668ms`, `29.686ms`; all hash `6346f03343d75a65`. The runtime branch was reverted and 5090 release binaries were rebuilt back to the retained HC GEMV/GemmEx split.
+- rejected HC pre-scaled input exact E2E log `$RESULT_ROOT/dsv4_hc_prescale_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected HC pre-scaled input fixed bench log `$RESULT_ROOT/dsv4_hc_prescale_bench.json`: aggregate steady TPOT avg `28.404ms`, per-iteration `28.392ms`, `28.402ms`, `28.419ms`; all generated-token hashes changed to `3ed2ed5c96344f69`
+- post-revert HC pre-scaled input fixed bench log `$RESULT_ROOT/dsv4_hc_prescale_reverted_bench.json`: aggregate steady TPOT avg `29.181ms`, per-iteration `29.260ms`, `29.456ms`, `28.828ms`; all hashes restored to `6346f03343d75a65`
+- rejected dense FP8 shared-memory downsize exact E2E log `$RESULT_ROOT/dsv4_fp8_shared32768_e2e.log`: failed case 0 with `CUDA_ERROR_ILLEGAL_ADDRESS` at `prefill layer 0 rank 0`
+- post-revert dense FP8 shared-memory downsize exact E2E log `$RESULT_ROOT/dsv4_fp8_shared32768_reverted_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- post-revert dense FP8 shared-memory downsize fixed bench log `$RESULT_ROOT/dsv4_fp8_shared32768_reverted_bench.json`: aggregate steady TPOT avg `28.739ms`, per-iteration `28.552ms`, `28.899ms`, `28.766ms`; all hashes restored to `6346f03343d75a65`
+- retained parallel score-select microbench log `$RESULT_ROOT/dsv4_score_select_bench.log`: serial vs parallel top-k select is bitwise identical for `seq_len={1,8,16,32}` with speedup about `1.50x`
+- retained parallel score-select exact E2E log `$RESULT_ROOT/dsv4_score_select_parallel_retained_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- retained parallel score-select fixed bench log `$RESULT_ROOT/dsv4_score_select_parallel_retained_bench.json`: aggregate steady TPOT avg `28.458ms`, per-iteration `28.343ms`, `28.468ms`, `28.562ms`; all hashes `6346f03343d75a65`
+- rejected hand routed W13 act_quant microbench log `$RESULT_ROOT/dsv4_act_quant_bench.log`: hand CUDA act_quant was bitwise-identical to TileLang for `hidden_dim={4096,2048}` and `rows={8,48,96}`, with `2.0-3.0x` standalone speedup.
+- rejected hand routed W13 act_quant exact E2E log `$RESULT_ROOT/dsv4_hand_act_quant_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected hand routed W13 act_quant fixed bench log `$RESULT_ROOT/dsv4_hand_act_quant_bench.json`: aggregate steady TPOT avg `28.802ms`, per-iteration `29.014ms`, `28.744ms`, `28.647ms`; all hashes `6346f03343d75a65`
+- post-revert hand act_quant exact E2E log `$RESULT_ROOT/dsv4_act_quant_restored_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- post-revert hand act_quant fixed bench logs `$RESULT_ROOT/dsv4_act_quant_restored_bench.json` and `$RESULT_ROOT/dsv4_act_quant_restored_bench_repeat.json`: first run aggregate steady TPOT avg `28.249ms` but one iteration hash changed to `a278a8140c25b812`; repeat aggregate steady TPOT avg `29.277ms`, per-iteration `29.265ms`, `29.272ms`, `29.293ms`, with all hashes restored to `6346f03343d75a65`
+- post-revert hand act_quant 5-run stability logs `$RESULT_ROOT/dsv4_stability_after_act_quant_revert_{1..5}.json`: aggregate steady TPOT avg `28.912ms`, `28.867ms`, `28.291ms`, `28.375ms`, and `28.715ms`; all 15 per-iteration hashes were `6346f03343d75a65`. Another CPU load was running during this sweep, so the result is a conservative sub-30 stability check rather than a clean machine best-band.
+- reviewer 5090 5-run stability rerun `$RESULT_ROOT/pegainfer_dev_pr101_bench_{1..5}.json`: aggregate steady TPOT avg `28.505793ms`, `28.087102ms`, `29.755957ms`, `27.552965ms`, and `29.371630ms`; all 15 per-iteration hashes were `6346f03343d75a65`. One run wrote the complete JSON report and logged scheduler exit, then segfaulted in NCCL shutdown; treat that as the existing shutdown cleanup issue, not decode TPOT or token-correctness evidence.
+- fused Q/KV RoPE exact E2E log `$RESULT_ROOT/dsv4_qkv_rope_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- fused Q/KV RoPE fixed bench logs `$RESULT_ROOT/dsv4_qkv_rope_bench.log` and `$RESULT_ROOT/dsv4_qkv_rope_bench_repeat.log`: per-iteration steady TPOT avg `28.215ms`, `28.256ms`, `28.236ms`, then `27.096ms`, `28.565ms`, `28.349ms`; all hash `6346f03343d75a65`
+- fused Q/KV RoPE short profile `$RESULT_ROOT/dsv4_qkv_rope_short.nsys-rep` and `$RESULT_ROOT/dsv4_qkv_rope_short_kernels_cuda_gpu_kern_sum.csv`: `deepseek_apply_rope_q_kv_kernel` appears in the kernel summary; residual hidden-RoPE kernels are from non-projection paths.
+- rejected Q/KV RoPE+KV quant exact E2E log `$RESULT_ROOT/dsv4_qkv_rope_quant_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected Q/KV RoPE+KV quant fixed bench log `$RESULT_ROOT/dsv4_qkv_rope_quant_bench.log`: aggregate steady TPOT avg `29.948ms`, per-iteration `29.885ms`, `29.910ms`, `30.048ms`; all hash `6346f03343d75a65`
+- rejected ratio-4 top-k concat removal exact E2E log `$RESULT_ROOT/dsv4_topk_no_concat_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected ratio-4 top-k concat removal fixed bench log `$RESULT_ROOT/dsv4_topk_no_concat_bench.log`: aggregate steady TPOT avg `29.541ms`, per-iteration `29.551ms`, `29.539ms`, `29.532ms`; all hash `6346f03343d75a65`
+- post-revert ratio-4 top-k fixed bench log `$RESULT_ROOT/dsv4_revert_topk_bench.log`: aggregate steady TPOT avg `28.333ms`, per-iteration `28.316ms`, `28.336ms`, `28.346ms`; all hash `6346f03343d75a65`
 - old split MoE/SwiGLU cleanup: local `cargo fmt --check`, local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4`, local `git diff --check`, 5090 `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4`, and 5090 release builds for `bench_serving` and `deepseek_v4_e2e` passed after removing stale public/FFI exports.
-- old split MoE/SwiGLU cleanup exact E2E log `/tmp/dsv4_fused_cleanup_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- old split MoE/SwiGLU cleanup fixed bench log `/tmp/dsv4_fused_cleanup_bench.log`: aggregate steady TPOT avg `27.860ms`, per-iteration `27.863ms`, `27.845ms`, `27.872ms`; all hash `6346f03343d75a65`
-- MoE reduce-scatter/shared overlap exact E2E log `/tmp/dsv4_moe_rs_overlap_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- MoE reduce-scatter/shared overlap fixed bench log `/tmp/dsv4_moe_rs_overlap_bench.log`: aggregate steady TPOT avg `26.791ms`, per-iteration `26.773ms`, `26.794ms`, `26.805ms`; all hash `6346f03343d75a65`
-- MoE reduce-scatter/shared overlap fixed bench repeats `/tmp/dsv4_moe_rs_overlap_bench_repeat.log` and `/tmp/dsv4_moe_rs_overlap_bench_repeat2.log`: aggregate steady TPOT avg `27.771ms` and `27.776ms`; per-iteration range `27.637-27.985ms`; all hash `6346f03343d75a65`
-- rejected full shared-expert overlap exact E2E log `/tmp/dsv4_shared_full_overlap_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected full shared-expert overlap fixed bench log `/tmp/dsv4_shared_full_overlap_bench.log`: aggregate steady TPOT avg `27.126ms`, but generated-token hashes changed to `877989965c7b859a`, `57230e28c8776f85`, and `da2087343aac2707`
-- post-revert MoE reduce-scatter/shared overlap exact E2E log `/tmp/dsv4_moe_rs_overlap_revert_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- post-revert MoE reduce-scatter/shared overlap fixed bench log `/tmp/dsv4_moe_rs_overlap_revert_bench.log`: aggregate steady TPOT avg `28.435ms`, per-iteration `28.536ms`, `28.387ms`, `28.381ms`; all hash `6346f03343d75a65`
-- MoE all-gather/reduce-scatter shared-overlap exact E2E log `/tmp/dsv4_moe_ag_overlap_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- MoE all-gather/reduce-scatter shared-overlap fixed bench logs `/tmp/dsv4_moe_ag_overlap_bench.log` and `/tmp/dsv4_moe_ag_overlap_bench_repeat.log`: aggregate steady TPOT avg `27.052ms` and `26.285ms`; per-iteration range `26.280-27.309ms`; all hash `6346f03343d75a65`
-- MoE all-gather/reduce-scatter shared-overlap short profile `/tmp/dsv4_ag_overlap_short.nsys-rep` and `/tmp/dsv4_ag_overlap_short_kernels_cuda_gpu_kern_sum.csv`: f32 all-reduce remains the largest wait-inclusive row at `27.6%`, routed W13/W2 are `6.5%`/`3.5%`, and BF16 all-gather is `5.4%`.
-- post-`32768` grouped-FP4 shared-memory short profile `/tmp/dsv4_shared32768_short.nsys-rep` and `/tmp/dsv4_shared32768_short_kernels_cuda_gpu_kern_sum.csv`: f32 all-reduce `19.3%`, f32 reduce-scatter `16.6%`, routed W13/W2 `8.9%`/`4.3%`, HC pre-norm `6.9%`, BF16 all-gather `4.8%`, score-route BF16 GEMM `4.7%`; use for composition only because nsys perturbed short-run TPOT to `30.64ms`.
-- compact active expert plus compact launch rows microbench log `/tmp/dsv4_compact_launch_rows_bench.log`: for active `8` and rows/active `8/16/32`, reducing compact launch rows from total rows to per-expert rows moved W13 from about `0.109-0.112ms` to `0.082-0.087ms` and W2 from about `0.056-0.057ms` to `0.043-0.045ms`; rejected for runtime until the scheduler can drive launch dimensions without route metadata D2H.
-- route-stat realistic compact launch rows log `/tmp/dsv4_compact_launch_rows_realistic_bench.log`: active `1/2` stayed flat at W13 about `0.0615ms` and W2 about `0.0328ms`; active `5` improved W13 `0.079858ms -> 0.063514ms` and W2 `0.045044ms -> 0.032787ms`. This makes problem sizes a tail optimization, not the main sub-25 lever.
-- arbitrary sparse counts grouped FP4 logs `/tmp/dsv4_arbitrary_counts_grouped_fp4_bench.log` and `/tmp/dsv4_arbitrary_counts_grouped_fp4_bound_bench.log`: the bench now supports `--counts` plus selected compact expert pointers. Sparse active ids show compact active expert z-dimension plus row bound speeds W13/W2 by `1.39-1.83x`, while `--capacity-launch-rows` without active z compaction is flat. This corrects the earlier prefix-active microbench interpretation and keeps the runtime blocker focused on no-D2H launch sizing.
-- rejected direct CUDA score-route microbench logs `/tmp/dsv4_score_route_direct_microbench.log` and `/tmp/dsv4_score_route_direct_bench_large.log`: direct projection beat cuBLAS for `seq_len>=8` in isolation with identical top-k indices on random fuzz, but runtime fixed bench changed generated-token hash.
-- rejected direct CUDA score-route runtime logs `/tmp/dsv4_score_route_direct_e2e.log` and `/tmp/dsv4_score_route_direct_bench.log`: exact E2E `20/20`, aggregate steady TPOT avg `28.340ms`, but fixed-bench hash changed to `abc4a0a2160d7963`; not retained.
-- post-revert direct CUDA score-route fixed bench log `/tmp/dsv4_score_route_direct_reverted_bench.log`: aggregate steady TPOT avg `28.477ms`, per-iteration `28.501ms`, `28.477ms`, `28.455ms`; hash restored to `6346f03343d75a65`.
-- rejected shared split-overlap exact E2E log `/tmp/dsv4_shared_split_overlap_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected shared split-overlap fixed bench logs `/tmp/dsv4_shared_split_overlap_bench.log` and `/tmp/dsv4_shared_split_overlap_bench_repeat.log`: aggregate steady TPOT avg `26.625ms` and `27.145ms`; all hash `6346f03343d75a65`
-- restored MoE all-gather/reduce-scatter shared-overlap fixed bench log `/tmp/dsv4_moe_ag_overlap_restored_bench.log`: aggregate steady TPOT avg `27.198ms`, per-iteration `27.195ms`, `27.203ms`, `27.198ms`; all hash `6346f03343d75a65`
-- rejected hash token-id repeat exact E2E log `/tmp/dsv4_repeat_tokens_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
-- rejected hash token-id repeat fixed bench log `/tmp/dsv4_repeat_tokens_bench.log`: aggregate steady TPOT avg `27.297ms`, per-iteration `27.285ms`, `27.333ms`, `27.273ms`; all hash `6346f03343d75a65`
-- temporary current-stage trace log `/tmp/dsv4_trace_current_bench.log`: token hash stayed `6346f03343d75a65`; after excluding the first layer-0 MoE warmup outlier, approximate 43-layer sums were attention local `17.37ms`, MoE `13.77ms`, attention collective+post `3.29ms`, HC FFN pre `2.33ms`, HC attention pre `2.19ms`, FFN post `0.45ms`. Trace code was removed after collection.
+- old split MoE/SwiGLU cleanup exact E2E log `$RESULT_ROOT/dsv4_fused_cleanup_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- old split MoE/SwiGLU cleanup fixed bench log `$RESULT_ROOT/dsv4_fused_cleanup_bench.log`: aggregate steady TPOT avg `27.860ms`, per-iteration `27.863ms`, `27.845ms`, `27.872ms`; all hash `6346f03343d75a65`
+- MoE reduce-scatter/shared overlap exact E2E log `$RESULT_ROOT/dsv4_moe_rs_overlap_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- MoE reduce-scatter/shared overlap fixed bench log `$RESULT_ROOT/dsv4_moe_rs_overlap_bench.log`: aggregate steady TPOT avg `26.791ms`, per-iteration `26.773ms`, `26.794ms`, `26.805ms`; all hash `6346f03343d75a65`
+- MoE reduce-scatter/shared overlap fixed bench repeats `$RESULT_ROOT/dsv4_moe_rs_overlap_bench_repeat.log` and `$RESULT_ROOT/dsv4_moe_rs_overlap_bench_repeat2.log`: aggregate steady TPOT avg `27.771ms` and `27.776ms`; per-iteration range `27.637-27.985ms`; all hash `6346f03343d75a65`
+- rejected full shared-expert overlap exact E2E log `$RESULT_ROOT/dsv4_shared_full_overlap_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected full shared-expert overlap fixed bench log `$RESULT_ROOT/dsv4_shared_full_overlap_bench.log`: aggregate steady TPOT avg `27.126ms`, but generated-token hashes changed to `877989965c7b859a`, `57230e28c8776f85`, and `da2087343aac2707`
+- post-revert MoE reduce-scatter/shared overlap exact E2E log `$RESULT_ROOT/dsv4_moe_rs_overlap_revert_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- post-revert MoE reduce-scatter/shared overlap fixed bench log `$RESULT_ROOT/dsv4_moe_rs_overlap_revert_bench.log`: aggregate steady TPOT avg `28.435ms`, per-iteration `28.536ms`, `28.387ms`, `28.381ms`; all hash `6346f03343d75a65`
+- MoE all-gather/reduce-scatter shared-overlap exact E2E log `$RESULT_ROOT/dsv4_moe_ag_overlap_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- MoE all-gather/reduce-scatter shared-overlap fixed bench logs `$RESULT_ROOT/dsv4_moe_ag_overlap_bench.log` and `$RESULT_ROOT/dsv4_moe_ag_overlap_bench_repeat.log`: aggregate steady TPOT avg `27.052ms` and `26.285ms`; per-iteration range `26.280-27.309ms`; all hash `6346f03343d75a65`
+- MoE all-gather/reduce-scatter shared-overlap short profile `$RESULT_ROOT/dsv4_ag_overlap_short.nsys-rep` and `$RESULT_ROOT/dsv4_ag_overlap_short_kernels_cuda_gpu_kern_sum.csv`: f32 all-reduce remains the largest wait-inclusive row at `27.6%`, routed W13/W2 are `6.5%`/`3.5%`, and BF16 all-gather is `5.4%`.
+- post-`32768` grouped-FP4 shared-memory short profile `$RESULT_ROOT/dsv4_shared32768_short.nsys-rep` and `$RESULT_ROOT/dsv4_shared32768_short_kernels_cuda_gpu_kern_sum.csv`: f32 all-reduce `19.3%`, f32 reduce-scatter `16.6%`, routed W13/W2 `8.9%`/`4.3%`, HC pre-norm `6.9%`, BF16 all-gather `4.8%`, score-route BF16 GEMM `4.7%`; use for composition only because nsys perturbed short-run TPOT to `30.64ms`.
+- compact active expert plus compact launch rows microbench log `$RESULT_ROOT/dsv4_compact_launch_rows_bench.log`: for active `8` and rows/active `8/16/32`, reducing compact launch rows from total rows to per-expert rows moved W13 from about `0.109-0.112ms` to `0.082-0.087ms` and W2 from about `0.056-0.057ms` to `0.043-0.045ms`; rejected for runtime until the scheduler can drive launch dimensions without route metadata D2H.
+- route-stat realistic compact launch rows log `$RESULT_ROOT/dsv4_compact_launch_rows_realistic_bench.log`: active `1/2` stayed flat at W13 about `0.0615ms` and W2 about `0.0328ms`; active `5` improved W13 `0.079858ms -> 0.063514ms` and W2 `0.045044ms -> 0.032787ms`. This makes problem sizes a tail optimization, not the main sub-25 lever.
+- arbitrary sparse counts grouped FP4 logs `$RESULT_ROOT/dsv4_arbitrary_counts_grouped_fp4_bench.log` and `$RESULT_ROOT/dsv4_arbitrary_counts_grouped_fp4_bound_bench.log`: the bench now supports `--counts` plus selected compact expert pointers. Sparse active ids show compact active expert z-dimension plus row bound speeds W13/W2 by `1.39-1.83x`, while `--capacity-launch-rows` without active z compaction is flat. This corrects the earlier prefix-active microbench interpretation and keeps the runtime blocker focused on no-D2H launch sizing.
+- rejected direct CUDA score-route microbench logs `$RESULT_ROOT/dsv4_score_route_direct_microbench.log` and `$RESULT_ROOT/dsv4_score_route_direct_bench_large.log`: direct projection beat cuBLAS for `seq_len>=8` in isolation with identical top-k indices on random fuzz, but runtime fixed bench changed generated-token hash.
+- rejected direct CUDA score-route runtime logs `$RESULT_ROOT/dsv4_score_route_direct_e2e.log` and `$RESULT_ROOT/dsv4_score_route_direct_bench.log`: exact E2E `20/20`, aggregate steady TPOT avg `28.340ms`, but fixed-bench hash changed to `abc4a0a2160d7963`; not retained.
+- post-revert direct CUDA score-route fixed bench log `$RESULT_ROOT/dsv4_score_route_direct_reverted_bench.log`: aggregate steady TPOT avg `28.477ms`, per-iteration `28.501ms`, `28.477ms`, `28.455ms`; hash restored to `6346f03343d75a65`.
+- rejected shared split-overlap exact E2E log `$RESULT_ROOT/dsv4_shared_split_overlap_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected shared split-overlap fixed bench logs `$RESULT_ROOT/dsv4_shared_split_overlap_bench.log` and `$RESULT_ROOT/dsv4_shared_split_overlap_bench_repeat.log`: aggregate steady TPOT avg `26.625ms` and `27.145ms`; all hash `6346f03343d75a65`
+- restored MoE all-gather/reduce-scatter shared-overlap fixed bench log `$RESULT_ROOT/dsv4_moe_ag_overlap_restored_bench.log`: aggregate steady TPOT avg `27.198ms`, per-iteration `27.195ms`, `27.203ms`, `27.198ms`; all hash `6346f03343d75a65`
+- rejected hash token-id repeat exact E2E log `$RESULT_ROOT/dsv4_repeat_tokens_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected hash token-id repeat fixed bench log `$RESULT_ROOT/dsv4_repeat_tokens_bench.log`: aggregate steady TPOT avg `27.297ms`, per-iteration `27.285ms`, `27.333ms`, `27.273ms`; all hash `6346f03343d75a65`
+- temporary current-stage trace log `$RESULT_ROOT/dsv4_trace_current_bench.log`: token hash stayed `6346f03343d75a65`; after excluding the first layer-0 MoE warmup outlier, approximate 43-layer sums were attention local `17.37ms`, MoE `13.77ms`, attention collective+post `3.29ms`, HC FFN pre `2.33ms`, HC attention pre `2.19ms`, FFN post `0.45ms`. Trace code was removed after collection.
 - W2 TopK weight/reduce atomic microbench used a temporary standalone source, compiled on 5090 with `/usr/local/cuda-12.9/bin/nvcc -O3 -std=c++17 -arch=sm_120`; the source was deleted after rejection to avoid leaving a stale integration path.
-- W2 TopK weight/reduce atomic microbench log `/tmp/dsv4_w2_weighted_reduce_bench.log`: for `seq_len={1,8,16,32}` and DSV4 `topk=6`, current deterministic reduce was `0.0023-0.0027ms`, atomic epilogue-shaped reduce was `0.0049-0.0061ms`, max abs diff stayed under `2.4e-7`; rejected before runtime integration.
-- fresh retained-runtime validation logs `/tmp/dsv4_fresh_e2e_after_w2_reduce_doc.log` and `/tmp/dsv4_fresh_bench_after_w2_reduce_doc.json`: exact E2E `All 20 DeepSeek V4 exact cases passed`; fixed bench aggregate steady TPOT avg `28.480ms`, per-iteration `28.505ms`, `28.470ms`, `28.466ms`, all hash `6346f03343d75a65`.
+- W2 TopK weight/reduce atomic microbench log `$RESULT_ROOT/dsv4_w2_weighted_reduce_bench.log`: for `seq_len={1,8,16,32}` and DSV4 `topk=6`, current deterministic reduce was `0.0023-0.0027ms`, atomic epilogue-shaped reduce was `0.0049-0.0061ms`, max abs diff stayed under `2.4e-7`; rejected before runtime integration.
+- fresh retained-runtime validation logs `$RESULT_ROOT/dsv4_fresh_e2e_after_w2_reduce_doc.log` and `$RESULT_ROOT/dsv4_fresh_bench_after_w2_reduce_doc.json`: exact E2E `All 20 DeepSeek V4 exact cases passed`; fixed bench aggregate steady TPOT avg `28.480ms`, per-iteration `28.505ms`, `28.470ms`, `28.466ms`, all hash `6346f03343d75a65`.
 - W13/SwiGLU layout microbench used a temporary standalone source, compiled on 5090 with `/usr/local/cuda-12.9/bin/nvcc -O3 -std=c++17 -arch=sm_120`; the source was deleted after rejection to avoid implying a retained layout path.
-- W13/SwiGLU layout microbench logs `/tmp/dsv4_swiglu_layout_bench.log` and `/tmp/dsv4_swiglu_layout_bench_route_rows.log`: pair-interleaved `[up, gate]` input was byte-identical to separate gate/up buffers, but only rows `96` showed a visible standalone gain (`0.003286ms -> 0.002579ms`); rejected before runtime integration.
-- grouped FP4 shared-memory probe logs `/tmp/dsv4_w13_shared_81920.log`, `/tmp/dsv4_w13_shared_65536.log`, `/tmp/dsv4_w13_shared_49152.log`, `/tmp/dsv4_w13_shared_32768.log`, `/tmp/dsv4_w13_shared_24576.log`, `/tmp/dsv4_w13_shared_16384.log`, and `/tmp/dsv4_w13_shared_32768_shapes.log`: `32768` bytes is bitwise-safe across tested W13/W2 sparse decode shapes, while `16384` bytes trips illegal memory access.
-- grouped FP4 shared-memory runtime validation logs `/tmp/dsv4_grouped_shared32768_e2e.log`, `/tmp/dsv4_grouped_shared32768_bench.log`, and `/tmp/dsv4_grouped_shared32768_bench_repeat.log`: exact E2E `20/20`; fixed bench aggregate steady TPOT avg `28.481ms` then `28.694ms`; all generated-token hashes `6346f03343d75a65`.
-- careful decode-mid profile calibration `/tmp/dsv4_profile_calibration_20260513_101406.json`: fixed bench aggregate steady TPOT avg `28.347ms`, p50 `28.122ms`, p95 `29.653ms`, all generated-token hashes `6346f03343d75a65`.
-- careful decode-mid profile `/tmp/dsv4_profile_decode_mid.nsys-rep`, `/tmp/dsv4_profile_decode_mid.sqlite`, `/tmp/dsv4_profile_decode_mid_stats_cuda_gpu_kern_sum.csv`, and `/tmp/dsv4_profile_decode_mid_stats_cuda_api_sum.csv`: delayed `--duration=4` capture with `--cuda-event-trace=false`; profile-run TPOT avg `29.222ms`, hash `6346f03343d75a65`. Aggregate GPU share: FP8 dense/shared `19.8%`, f32 reduce-scatter wait-inclusive `18.6%`, HC/indexer `14.9%`, routed W13 `10.3%`, f32 all-reduce wait-inclusive `8.8%`, score router `7.5%`, attention local `5.5%`, routed W2 `5.0%`, MoE all-gather wait-inclusive `3.2%`, routed SwiGLU+quant `0.7%`.
+- W13/SwiGLU layout microbench logs `$RESULT_ROOT/dsv4_swiglu_layout_bench.log` and `$RESULT_ROOT/dsv4_swiglu_layout_bench_route_rows.log`: pair-interleaved `[up, gate]` input was byte-identical to separate gate/up buffers, but only rows `96` showed a visible standalone gain (`0.003286ms -> 0.002579ms`); rejected before runtime integration.
+- grouped FP4 shared-memory probe logs `$RESULT_ROOT/dsv4_w13_shared_81920.log`, `$RESULT_ROOT/dsv4_w13_shared_65536.log`, `$RESULT_ROOT/dsv4_w13_shared_49152.log`, `$RESULT_ROOT/dsv4_w13_shared_32768.log`, `$RESULT_ROOT/dsv4_w13_shared_24576.log`, `$RESULT_ROOT/dsv4_w13_shared_16384.log`, and `$RESULT_ROOT/dsv4_w13_shared_32768_shapes.log`: `32768` bytes is bitwise-safe across tested W13/W2 sparse decode shapes, while `16384` bytes trips illegal memory access.
+- grouped FP4 shared-memory runtime validation logs `$RESULT_ROOT/dsv4_grouped_shared32768_e2e.log`, `$RESULT_ROOT/dsv4_grouped_shared32768_bench.log`, and `$RESULT_ROOT/dsv4_grouped_shared32768_bench_repeat.log`: exact E2E `20/20`; fixed bench aggregate steady TPOT avg `28.481ms` then `28.694ms`; all generated-token hashes `6346f03343d75a65`.
+- careful decode-mid profile calibration `$RESULT_ROOT/dsv4_profile_calibration_20260513_101406.json`: fixed bench aggregate steady TPOT avg `28.347ms`, p50 `28.122ms`, p95 `29.653ms`, all generated-token hashes `6346f03343d75a65`.
+- careful decode-mid profile `$RESULT_ROOT/dsv4_profile_decode_mid.nsys-rep`, `$RESULT_ROOT/dsv4_profile_decode_mid.sqlite`, `$RESULT_ROOT/dsv4_profile_decode_mid_stats_cuda_gpu_kern_sum.csv`, and `$RESULT_ROOT/dsv4_profile_decode_mid_stats_cuda_api_sum.csv`: delayed `--duration=4` capture with `--cuda-event-trace=false`; profile-run TPOT avg `29.222ms`, hash `6346f03343d75a65`. Aggregate GPU share: FP8 dense/shared `19.8%`, f32 reduce-scatter wait-inclusive `18.6%`, HC/indexer `14.9%`, routed W13 `10.3%`, f32 all-reduce wait-inclusive `8.8%`, score router `7.5%`, attention local `5.5%`, routed W2 `5.0%`, MoE all-gather wait-inclusive `3.2%`, routed SwiGLU+quant `0.7%`.
 - careful decode-mid sqlite drilldown: device-0 W13/W2 grouped launches usually use fixed `grid=(32,2,32), block=128`; `1727/4069` W13 and W2 launches were `<5us`, while heavy W13 launches occupied the `70us+` buckets and f32 reduce-scatter had `1721/4026` launches `>=120us`. Empty/near-empty grouped launches are therefore not the main remaining lever by themselves.
-- current allocation counter rerun `/tmp/dsv4_cuda_api_counter_now.json` and `/tmp/dsv4_cuda_api_counter_now.err`: short `--output-len 64 --warmup 1 --iters 1 --seed 42` run reported steady TPOT avg `29.355ms`; `cuMemAllocAsync/cuMemFreeAsync/cuMemsetD8Async`, `cudaMallocAsync/cudaFreeAsync/cudaMemsetAsync`, and async H2D/D2H counters were all `0`, while `cudaLaunchKernel` was `2074256`. This is the application-visible check that overrides noisy nsys async-allocation attribution.
-- rejected grouped FP4 launch-bounds=2 logs `/tmp/dsv4_w13_launch_bounds2_microbench.log`, `/tmp/dsv4_launch_bounds2_e2e.log`, and `/tmp/dsv4_launch_bounds2_bench.log`: exact E2E `20/20`; fixed bench aggregate steady TPOT avg `28.522ms`; all generated-token hashes `6346f03343d75a65`; not retained because it did not beat the retained `32768` shared-memory path.
-- rejected naive grouped FP4 `block_M=16` logs `/tmp/dsv4_w13_block_m16_bench.log` and `/tmp/dsv4_w13_block_m16_large_rows_bench.log`: decode-like small rows sped up, but rows/active `32` failed fuzz because grouped transforms/wrappers still have hard-coded `32`-row assumptions; not retained.
-- rejected parameterized grouped FP4 `block_M=16` logs `/tmp/dsv4_w13_block_m16_param_fuzz.log`, `/tmp/dsv4_grouped_block_m16_e2e.log`, `/tmp/dsv4_grouped_block_m16_bench.log`, and `/tmp/dsv4_grouped_block_m16_bench_repeat.log`: broad fuzz and exact E2E passed, token hash stayed `6346f03343d75a65`, but fixed bench regressed to aggregate steady TPOT avg `28.971ms` then `29.797ms`; local and 5090 were restored to grouped FP4 `block_M=32`.
-- post-restore grouped FP4 fixed bench log `/tmp/dsv4_grouped_block_m16_restored_bench.log`: aggregate steady TPOT avg `28.736ms`, per-iteration `28.445ms`, `28.998ms`, `28.763ms`; all hash `6346f03343d75a65`.
+- current allocation counter rerun `$RESULT_ROOT/dsv4_cuda_api_counter_now.json` and `$RESULT_ROOT/dsv4_cuda_api_counter_now.err`: short `--output-len 64 --warmup 1 --iters 1 --seed 42` run reported steady TPOT avg `29.355ms`; `cuMemAllocAsync/cuMemFreeAsync/cuMemsetD8Async`, `cudaMallocAsync/cudaFreeAsync/cudaMemsetAsync`, and async H2D/D2H counters were all `0`, while `cudaLaunchKernel` was `2074256`. This is the application-visible check that overrides noisy nsys async-allocation attribution.
+- rejected grouped FP4 launch-bounds=2 logs `$RESULT_ROOT/dsv4_w13_launch_bounds2_microbench.log`, `$RESULT_ROOT/dsv4_launch_bounds2_e2e.log`, and `$RESULT_ROOT/dsv4_launch_bounds2_bench.log`: exact E2E `20/20`; fixed bench aggregate steady TPOT avg `28.522ms`; all generated-token hashes `6346f03343d75a65`; not retained because it did not beat the retained `32768` shared-memory path.
+- rejected naive grouped FP4 `block_M=16` logs `$RESULT_ROOT/dsv4_w13_block_m16_bench.log` and `$RESULT_ROOT/dsv4_w13_block_m16_large_rows_bench.log`: decode-like small rows sped up, but rows/active `32` failed fuzz because grouped transforms/wrappers still have hard-coded `32`-row assumptions; not retained.
+- rejected parameterized grouped FP4 `block_M=16` logs `$RESULT_ROOT/dsv4_w13_block_m16_param_fuzz.log`, `$RESULT_ROOT/dsv4_grouped_block_m16_e2e.log`, `$RESULT_ROOT/dsv4_grouped_block_m16_bench.log`, and `$RESULT_ROOT/dsv4_grouped_block_m16_bench_repeat.log`: broad fuzz and exact E2E passed, token hash stayed `6346f03343d75a65`, but fixed bench regressed to aggregate steady TPOT avg `28.971ms` then `29.797ms`; local and 5090 were restored to grouped FP4 `block_M=32`.
+- post-restore grouped FP4 fixed bench log `$RESULT_ROOT/dsv4_grouped_block_m16_restored_bench.log`: aggregate steady TPOT avg `28.736ms`, per-iteration `28.445ms`, `28.998ms`, `28.763ms`; all hash `6346f03343d75a65`.
 - completion audit and cleanup: local `git diff --check`, `cargo fmt --check`, and `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed after documenting the sub-25 gap and deleting untracked rejected bench sources. The retained tool sources are `score_select_bench.cu`, `swiglu_quant_bench.cu`, and `w13_grouped_fp4_bench.cu`.
 - vLLM/SGLang large-batch gap audit: source inspection confirmed the mature FP4 MoE throughput path combines static W13/W2 weight reorder, FP4 scale interleave, packed routed top-k, and problem-size-aware grouped backends. This supports keeping packed MoE layout as a separate bs>100 architecture project rather than mixing it into the current sub-25 latency patch.
-- `gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
-- `nm -D /tmp/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
+- `gcc -shared -fPIC -O2 -Wall -Wextra -o $RESULT_ROOT/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
+- `nm -D $RESULT_ROOT/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 
 The benchmark process still prints the existing NCCL communicator abort panic during shutdown after JSON output and scheduler exit. Track that as shutdown cleanup, not decode TPOT evidence.
 

@@ -13,10 +13,10 @@ warmup before the measured bs64/o128 pass.
 
 Artifacts:
 
-- Output dir: `/tmp/kimi-vllm-dp8-warmup-20260525`
-- Server log: `/tmp/kimi-vllm-dp8-warmup-20260525/server.log`
-- Warmup result: `/tmp/kimi-vllm-dp8-warmup-20260525/warmup_bs64_o128.json`
-- Measured result: `/tmp/kimi-vllm-dp8-warmup-20260525/measure_bs64_o128_after_warmup.json`
+- Output dir: `$RESULT_ROOT/kimi-vllm-dp8-warmup-20260525`
+- Server log: `$RESULT_ROOT/kimi-vllm-dp8-warmup-20260525/server.log`
+- Warmup result: `$RESULT_ROOT/kimi-vllm-dp8-warmup-20260525/warmup_bs64_o128.json`
+- Measured result: `$RESULT_ROOT/kimi-vllm-dp8-warmup-20260525/measure_bs64_o128_after_warmup.json`
 
 Server log evidence:
 
@@ -39,13 +39,13 @@ cross-hardware/backend check.
 | 项 | 值 |
 | --- | --- |
 | GPU | 8× NVIDIA H20（143 GB） |
-| Model | Kimi-K2.5（local `/data/models/Kimi-K2.5`，INT4 + BF16 scale Marlin WNA16） |
-| vLLM | `0.19.0`（venv `/root/develop/xingming/vllm_test/.venv`） |
+| Model | Kimi-K2.5（local `$MODEL_DIR`，INT4 + BF16 scale Marlin WNA16） |
+| vLLM | `0.19.0`（venv `$VLLM_DIR/.venv`） |
 | Sharding | **vLLM**: TP=1, DP=8, EP=8，all2all backend `allgather_reducescatter`（NCCL，默认） |
 | Sharding | **pegainfer**: TP=8, EP=8，NCCL F32 hidden bridge + RS routed bridge |
 | Profile | input_len=1, output_len=128, `--ignore-eos`, `--random-range-ratio 0` |
 | Bench | `vllm bench serve --backend openai --endpoint /v1/completions`（同一 client，两边对齐） |
-| 数据 | `/root/develop/xingming/vllm_test/kimi_dp8_baseline/result_*.json` |
+| 数据 | `$VLLM_DIR/kimi_dp8_baseline/result_*.json` |
 
 ## vLLM bs sweep
 
@@ -94,7 +94,7 @@ pegainfer 当前 `KIMI_RUNNER_MAX_BATCH=4` 硬上限，没扫 bs。同 client / 
 | Output tok/s | `159.99` | `157.94` | `≈278` |
 
 数据来源：
-- pegainfer HTTP：`result_pegainfer_bs4.json`，server 是 `target/release/pegainfer --model-path /data/models/Kimi-K2.5 --port 8124 --cuda-graph true`，client 同 vLLM 那条 bench。
+- pegainfer HTTP：`result_pegainfer_bs4.json`，server 是 `target/release/pegainfer --model-path $MODEL_DIR --port 8124 --cuda-graph true`，client 同 vLLM 那条 bench。
 - vLLM bs=4：上面 sweep 表的 bs=4 行。
 - pegainfer in-process：`bench_serving request --cuda-graph true --concurrency 4`，见 optimization.md。
 
@@ -110,23 +110,23 @@ pegainfer 当前 `KIMI_RUNNER_MAX_BATCH=4` 硬上限，没扫 bs。同 client / 
 
 ## 复现命令
 
-vLLM server（h20-100）：
+vLLM server（H20 node）：
 
 ```bash
-source /root/develop/xingming/vllm_test/.venv/bin/activate
-vllm serve /data/models/Kimi-K2.5 \
+source $VLLM_DIR/.venv/bin/activate
+vllm serve $MODEL_DIR \
   --trust-remote-code \
   --tensor-parallel-size 1 --data-parallel-size 8 --enable-expert-parallel \
   --served-model-name kimi-k2.5 \
   --port 8123 --max-num-seqs 256 --max-model-len 4096
 ```
 
-pegainfer server（h20-100）：
+pegainfer server（H20 node）：
 
 ```bash
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:$LD_LIBRARY_PATH \
-  /root/develop/xingming/pegainfer-kimi-k2-main/target/release/pegainfer \
-  --model-path /data/models/Kimi-K2.5 --port 8124 --cuda-graph true
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:$LD_LIBRARY_PATH \
+  $PEGAINFER_DIR/target/release/pegainfer \
+  --model-path $MODEL_DIR --port 8124 --cuda-graph true
 ```
 
 bench（client 端，对哪个 server 改 `--base-url` 即可）：
@@ -134,7 +134,7 @@ bench（client 端，对哪个 server 改 `--base-url` 即可）：
 ```bash
 vllm bench serve \
   --backend openai \
-  --model /data/models/Kimi-K2.5 --tokenizer /data/models/Kimi-K2.5 --trust-remote-code \
+  --model $MODEL_DIR --tokenizer $MODEL_DIR --trust-remote-code \
   --base-url http://127.0.0.1:8124 --endpoint /v1/completions \
   --dataset-name random \
   --random-input-len 1 --random-output-len 128 --random-range-ratio 0 \
@@ -142,4 +142,4 @@ vllm bench serve \
   --percentile-metrics ttft,tpot,itl --metric-percentiles 50,95,99
 ```
 
-完整 sweep 脚本：`/root/develop/xingming/vllm_test/kimi_dp8_baseline/kimi_dp8_sweep.sh`。
+完整 sweep 脚本：`$VLLM_DIR/kimi_dp8_baseline/kimi_dp8_sweep.sh`。

@@ -16,16 +16,24 @@ use safetensors::tensor::{TensorView, serialize};
 use serde_json::json;
 use std::{
     fs,
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+fn kimi_model_dir(env_var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(env_var)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(fallback))
+}
+
 #[test]
 fn real_kimi_index_scans_when_present() {
-    let path = Path::new("/data/models/Kimi-K2.6/model.safetensors.index.json");
+    let path = kimi_model_dir("PEGAINFER_KIMI_K26_MODEL_DIR", "models/Kimi-K2.6")
+        .join("model.safetensors.index.json");
     if !path.exists() {
         return;
     }
-    let manifest = KimiK2WeightManifest::from_index_file(path).unwrap();
+    let manifest = KimiK2WeightManifest::from_index_file(&path).unwrap();
     assert_eq!(manifest.layers.len(), KIMI_K2_LAYERS);
     assert_eq!(manifest.text_tensor_count, 208_215);
     assert_eq!(manifest.ignored_non_text_tensor_count, 335);
@@ -51,14 +59,14 @@ fn real_kimi_index_scans_when_present() {
 #[test]
 #[ignore = "H20-only: loads rank0 sliced Kimi-K2.5 payload into GPU memory"]
 fn h20_kimi_k25_rank0_sliced_payload_loads_typed_gpu_view() {
-    let model_path = Path::new("/data/models/Kimi-K2.5");
+    let model_path = kimi_model_dir("PEGAINFER_KIMI_K25_MODEL_DIR", "models/Kimi-K2.5");
     assert!(
         model_path.join(KIMI_K2_WEIGHT_INDEX).exists(),
         "missing H20 Kimi-K2.5 weights at {}",
         model_path.display()
     );
 
-    let manifest = KimiK2WeightManifest::from_model_dir(model_path).unwrap();
+    let manifest = KimiK2WeightManifest::from_model_dir(&model_path).unwrap();
     let names = manifest.rank_weight_names(0).unwrap();
     let load_plan = manifest.rank_sliced_load_plan(0).unwrap();
     assert_eq!(load_plan.rank, 0);
@@ -68,7 +76,7 @@ fn h20_kimi_k25_rank0_sliced_payload_loads_typed_gpu_view() {
     assert_eq!(names.plan.local_expert_range, 0..48);
 
     let ctx = KimiRankGpuContext::new(0).unwrap();
-    let weights = load_rank_sliced_weights_to_gpu(&ctx, model_path, &load_plan).unwrap();
+    let weights = load_rank_sliced_weights_to_gpu(&ctx, &model_path, &load_plan).unwrap();
     assert_eq!(weights.rank, 0);
     assert_eq!(weights.tensors.len(), names.plan.tensor_count);
     assert!(weights.total_bytes > 0);
@@ -128,18 +136,18 @@ fn h20_kimi_k25_rank0_sliced_payload_loads_typed_gpu_view() {
 #[test]
 #[ignore = "H20-only: packages rank0 Kimi-K2.5 routed experts into Marlin WNA16 runtime buffers"]
 fn h20_kimi_k25_rank0_marlin_expert_package_loads() {
-    let model_path = Path::new("/data/models/Kimi-K2.5");
+    let model_path = kimi_model_dir("PEGAINFER_KIMI_K25_MODEL_DIR", "models/Kimi-K2.5");
     assert!(
         model_path.join(KIMI_K2_WEIGHT_INDEX).exists(),
         "missing H20 Kimi-K2.5 weights at {}",
         model_path.display()
     );
 
-    let manifest = KimiK2WeightManifest::from_model_dir(model_path).unwrap();
+    let manifest = KimiK2WeightManifest::from_model_dir(&model_path).unwrap();
     let names = manifest.rank_weight_names(0).unwrap();
     let load_plan = manifest.rank_sliced_load_plan(0).unwrap();
     let ctx = KimiRankGpuContext::new(0).unwrap();
-    let mut weights = load_rank_sliced_weights_to_gpu(&ctx, model_path, &load_plan).unwrap();
+    let mut weights = load_rank_sliced_weights_to_gpu(&ctx, &model_path, &load_plan).unwrap();
     let original_total_bytes = weights.total_bytes;
     let marlin_weights = weights
         .pack_rank_expert_marlin_weights(&ctx, &names)
@@ -177,13 +185,11 @@ fn h20_kimi_k25_rank0_marlin_expert_package_loads() {
 #[test]
 #[ignore = "H20-only: compares real Kimi-K2.5 rank0 layer1 Marlin routed expert against vLLM"]
 fn h20_kimi_k25_rank0_layer1_marlin_wna16_matches_vllm_reference() {
-    use std::path::PathBuf;
-
     const TOKENS: usize = 4;
     const BLOCK_SIZE: usize = 8;
     const LAYER_IDX: usize = 1;
 
-    let model_path = Path::new("/data/models/Kimi-K2.5");
+    let model_path = kimi_model_dir("PEGAINFER_KIMI_K25_MODEL_DIR", "models/Kimi-K2.5");
     assert!(
         model_path.join(KIMI_K2_WEIGHT_INDEX).exists(),
         "missing H20 Kimi-K2.5 weights at {}",
@@ -191,18 +197,18 @@ fn h20_kimi_k25_rank0_layer1_marlin_wna16_matches_vllm_reference() {
     );
     let reference_dir = std::env::var("PEGAINFER_KIMI_K25_MARLIN_LAYER_REFERENCE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/data/fixtures/kimi-k2/k25_rank0_layer1_marlin_vllm"));
+        .unwrap_or_else(|_| PathBuf::from("fixtures/kimi-k2/k25_rank0_layer1_marlin_vllm"));
     assert!(
         reference_dir.join("metadata.json").exists(),
         "missing vLLM real layer Marlin reference at {}",
         reference_dir.display()
     );
 
-    let manifest = KimiK2WeightManifest::from_model_dir(model_path).unwrap();
+    let manifest = KimiK2WeightManifest::from_model_dir(&model_path).unwrap();
     let names = manifest.rank_weight_names(0).unwrap();
     let load_plan = manifest.rank_sliced_load_plan(0).unwrap();
     let ctx = KimiRankGpuContext::new(0).unwrap();
-    let weights = load_rank_sliced_weights_to_gpu(&ctx, model_path, &load_plan).unwrap();
+    let weights = load_rank_sliced_weights_to_gpu(&ctx, &model_path, &load_plan).unwrap();
     let typed = weights.typed_view(&names).unwrap();
     let layer1 = typed
         .pack_expert_major_layer_marlin_weights(&ctx, LAYER_IDX)

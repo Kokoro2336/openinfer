@@ -454,7 +454,7 @@ PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b \
   --batch-sizes 1 \
   --variants non_partition,split_kv_256x64 \
   --iters 4 \
-  --out /tmp/qwen3_kernel_snapshot_smoke.json
+  --out $RESULT_ROOT/qwen3_kernel_snapshot_smoke.json
 ```
 
 Compare command:
@@ -463,8 +463,8 @@ Compare command:
 cargo bench -p pegainfer-qwen3-4b \
   --bench qwen3_kernel_snapshot -- \
   compare \
-  --base /tmp/qwen3_kernel_snapshot_smoke.json \
-  --new /tmp/qwen3_kernel_snapshot_smoke.json
+  --base $RESULT_ROOT/qwen3_kernel_snapshot_smoke.json \
+  --new $RESULT_ROOT/qwen3_kernel_snapshot_smoke.json
 ```
 
 The JSON snapshot records:
@@ -501,7 +501,7 @@ PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b \
   --batch-sizes 1 \
   --variants non_partition,split_kv_256x64 \
   --iters 4 \
-  --out /tmp/qwen3_kernel_snapshot_cupti_smoke.json
+  --out $RESULT_ROOT/qwen3_kernel_snapshot_cupti_smoke.json
 ```
 
 Verification:
@@ -510,7 +510,7 @@ Verification:
 | --- | --- |
 | `PEGAINFER_CUDA_SM=120 cargo clippy --release -p pegainfer-cupti -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- -D warnings` | pass |
 | `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<model-path> cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture` | pass |
-| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out /tmp/qwen3_kernel_snapshot_cupti_smoke.json` | pass |
+| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out $RESULT_ROOT/qwen3_kernel_snapshot_cupti_smoke.json` | pass |
 
 The SM counters are intentionally minimal. `sm__throughput.avg.pct_of_peak_sustained_elapsed` shows whether SMs are busy over elapsed time; `smsp__warps_active.avg.pct_of_peak_sustained_active` shows active-warp residency while SM partitions are active. At `bs=1,ctx=10000`, non-partition measured `1.19%` SM throughput and `6.59%` DRAM peak, while split-K measured `8.74%` SM throughput and `41.06%` DRAM peak for nearly identical DRAM read bytes. That is the kernel snapshot evidence for low-batch underfill.
 
@@ -531,8 +531,8 @@ Verification after consolidation:
 | `git diff --check` | pass |
 | `PEGAINFER_CUDA_SM=120 cargo check --release -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot` on the CUDA validation host | pass |
 | `PEGAINFER_CUDA_SM=120 cargo clippy --release -p pegainfer-cupti -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- -D warnings` on the CUDA validation host | pass |
-| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out /tmp/qwen3_kernel_snapshot_single_bench_smoke.json` on the CUDA validation host | pass |
-| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- compare --base /tmp/qwen3_kernel_snapshot_single_bench_smoke.json --new /tmp/qwen3_kernel_snapshot_single_bench_smoke.json` on the CUDA validation host | pass |
+| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- run --contexts 1024 --batch-sizes 1 --variants non_partition,split_kv_256x64 --iters 4 --out $RESULT_ROOT/qwen3_kernel_snapshot_single_bench_smoke.json` on the CUDA validation host | pass |
+| `PEGAINFER_CUDA_SM=120 cargo bench -p pegainfer-qwen3-4b --bench qwen3_kernel_snapshot -- compare --base $RESULT_ROOT/qwen3_kernel_snapshot_single_bench_smoke.json --new $RESULT_ROOT/qwen3_kernel_snapshot_single_bench_smoke.json` on the CUDA validation host | pass |
 
 ## Debrief
 

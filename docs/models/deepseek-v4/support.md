@@ -116,7 +116,7 @@ cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test e2e 
 The full DeepSeek V4 `mp8_manifest` release test passes:
 
 ```bash
-PEGAINFER_TEST_MODEL_PATH=/data/DeepSeek-V4-Flash \
+PEGAINFER_TEST_MODEL_PATH=$MODEL_DIR \
 PEGAINFER_NVCC_JOBS=8 \
 cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest -- --nocapture
 ```
@@ -135,7 +135,7 @@ Server command used for HTTP validation:
 
 ```bash
 PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --features deepseek-v4 -- \
-  --model-path /data/DeepSeek-V4-Flash --port 18080
+  --model-path $MODEL_DIR --port 18080
 ```
 
 Verified `/v1/chat/completions`:
@@ -148,7 +148,7 @@ Representative chat request:
 ```bash
 curl -s http://127.0.0.1:18080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"/data/DeepSeek-V4-Flash","messages":[{"role":"user","content":"请只输出最终答案，不要解释。2024年2月有多少天？"}],"temperature":0,"max_tokens":64}'
+  -d '{"model":"$MODEL_DIR","messages":[{"role":"user","content":"请只输出最终答案，不要解释。2024年2月有多少天？"}],"temperature":0,"max_tokens":64}'
 ```
 
 Verified `/v1/completions` with the raw official prompt string:
@@ -162,7 +162,7 @@ Representative completions request:
 ```bash
 curl -s http://127.0.0.1:18080/v1/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"/data/DeepSeek-V4-Flash","prompt":"<｜begin▁of▁sentence｜><｜User｜>请只输出最终答案，不要解释。2024年2月有多少天？<｜Assistant｜></think>","temperature":0,"max_tokens":64}'
+  -d '{"model":"$MODEL_DIR","prompt":"<｜begin▁of▁sentence｜><｜User｜>请只输出最终答案，不要解释。2024年2月有多少天？<｜Assistant｜></think>","temperature":0,"max_tokens":64}'
 ```
 
 Unsupported non-greedy/logprobs requests are terminated before generation with a visible `stop_reason` instead of being silently coerced to greedy. Validation command shape:
@@ -170,7 +170,7 @@ Unsupported non-greedy/logprobs requests are terminated before generation with a
 ```bash
 curl -s http://127.0.0.1:18080/v1/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"/data/DeepSeek-V4-Flash","prompt":"<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>","temperature":0.7,"max_tokens":8}'
+  -d '{"model":"$MODEL_DIR","prompt":"<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>","temperature":0.7,"max_tokens":8}'
 ```
 
 Verified response status is `200`, `completion_tokens=0`, `finish_reason="stop"`, and `stop_reason` contains the greedy-only rejection message.
@@ -198,7 +198,7 @@ The current synthetic decode-heavy baseline on 5090-dev is:
 
 ```bash
 PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
-  --model-path /data/DeepSeek-V4-Flash --format json \
+  --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
@@ -246,11 +246,11 @@ Before opening the PR, keep the required gate focused:
 - `cargo fmt --check -p pegainfer-deepseek-v4`
 - `cargo check --release -p pegainfer-server`
 - `PEGAINFER_NVCC_JOBS=8 cargo check --release -p pegainfer-server --features deepseek-v4`
-- `PEGAINFER_TEST_MODEL_PATH=/data/DeepSeek-V4-Flash PEGAINFER_NVCC_JOBS=8 cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest -- --nocapture`
+- `PEGAINFER_TEST_MODEL_PATH=$MODEL_DIR PEGAINFER_NVCC_JOBS=8 cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest -- --nocapture`
 - four exact E2E slices over `test_data/deepseek-v4-ground-truth.json`, using:
 
 ```bash
-PEGAINFER_TEST_MODEL_PATH=/data/DeepSeek-V4-Flash \
+PEGAINFER_TEST_MODEL_PATH=$MODEL_DIR \
 PEGAINFER_DEEPSEEK_GT_OFFSET=<0|5|10|15> \
 PEGAINFER_DEEPSEEK_GT_LIMIT=5 \
 PEGAINFER_DEEPSEEK_GT_MAX_NEW_TOKENS=64 \

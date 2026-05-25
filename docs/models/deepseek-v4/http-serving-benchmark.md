@@ -49,17 +49,17 @@ Start the OpenAI-compatible HTTP endpoint:
 
 ```bash
 $CARGO_TARGET_DIR/release/pegainfer \
-  --model-path /data/DeepSeek-V4-Flash \
-  --port 18118 2>&1 | tee /tmp/dsv4_http_server.log
+  --model-path $MODEL_DIR \
+  --port 18118 2>&1 | tee $RESULT_ROOT/dsv4_http_server.log
 ```
 
 For prefill phase attribution, start the endpoint with profiling enabled:
 
 ```bash
 $CARGO_TARGET_DIR/release/pegainfer \
-  --model-path /data/DeepSeek-V4-Flash \
+  --model-path $MODEL_DIR \
   --port 18118 \
-  --deepseek-prefill-profile 2>&1 | tee /tmp/dsv4_http_server_profile.log
+  --deepseek-prefill-profile 2>&1 | tee $RESULT_ROOT/dsv4_http_server_profile.log
 ```
 
 Profiling inserts CUDA synchronization around rank-0 prefill phases. Use it to
@@ -76,15 +76,15 @@ Run the HTTP serving benchmark:
 ```bash
 python3 scripts/bench_http_serving.py \
   --base-url http://127.0.0.1:18118 \
-  --model /data/DeepSeek-V4-Flash \
+  --model $MODEL_DIR \
   --warmup 2 \
   --num-requests 8 \
   --concurrency 2 \
   --prompt-words 16 \
   --max-tokens 16 \
   --timeout 240 \
-  --server-log /tmp/dsv4_http_server.log \
-  --out /tmp/dsv4_http_bench_task18.json
+  --server-log $RESULT_ROOT/dsv4_http_server.log \
+  --out $RESULT_ROOT/dsv4_http_bench_task18.json
 ```
 
 Run the P1 concurrency / max-token sweep:
@@ -92,7 +92,7 @@ Run the P1 concurrency / max-token sweep:
 ```bash
 python3 scripts/bench_http_sweep.py \
   --base-url http://127.0.0.1:18118 \
-  --model /data/DeepSeek-V4-Flash \
+  --model $MODEL_DIR \
   --warmup 2 \
   --num-requests 8 \
   --concurrency 1,2,4,8 \
@@ -100,8 +100,8 @@ python3 scripts/bench_http_sweep.py \
   --repeats 3 \
   --prompt-words 16 \
   --timeout 240 \
-  --server-log /tmp/dsv4_http_server.log \
-  --out-dir /tmp/dsv4_http_sweep_task4
+  --server-log $RESULT_ROOT/dsv4_http_server.log \
+  --out-dir $RESULT_ROOT/dsv4_http_sweep_task4
 ```
 
 Run the prompt-length sweep that feeds the prefill optimization target:
@@ -109,7 +109,7 @@ Run the prompt-length sweep that feeds the prefill optimization target:
 ```bash
 python3 scripts/bench_http_sweep.py \
   --base-url http://127.0.0.1:18118 \
-  --model /data/DeepSeek-V4-Flash \
+  --model $MODEL_DIR \
   --warmup 1 \
   --num-requests 1 \
   --concurrency 1 \
@@ -117,8 +117,8 @@ python3 scripts/bench_http_sweep.py \
   --repeats 1 \
   --prompt-words 16,128,512,2048 \
   --timeout 600 \
-  --server-log /tmp/dsv4_http_server_profile.log \
-  --out-dir /tmp/dsv4_http_prompt_profile_task4
+  --server-log $RESULT_ROOT/dsv4_http_server_profile.log \
+  --out-dir $RESULT_ROOT/dsv4_http_prompt_profile_task4
 ```
 
 The script is intentionally model-server agnostic at the HTTP layer. It only
@@ -139,7 +139,7 @@ host. It describes only this commit, machine, endpoint, and harness.
 | --- | --- |
 | Commit | PR body records the validated head; tracked docs avoid self-referential commit hashes. |
 | Endpoint | OpenAI-compatible `/v1/completions`, streaming |
-| Model | `/data/DeepSeek-V4-Flash` |
+| Model | `$MODEL_DIR` |
 | Workload | warmup `2`, measured requests `8`, concurrency `2`, prompt words `16`, max tokens `16`, temperature `0`, ignore EOS `true`, timeout `240s` |
 | Result | completed `8`, failed `0`, timeout `0`, error rate `0.0` |
 | QPS | `1.6869` completed requests/s |
@@ -253,7 +253,7 @@ Both runs used the same head, model, and workload:
 | Field | Value |
 | --- | --- |
 | Commit | `bf9e7d9` |
-| Model | `/data/DeepSeek-V4-Flash` |
+| Model | `$MODEL_DIR` |
 | HTTP workload | prompt words `8192` (`10580` tokens), `max_tokens=1`, concurrency `1`, measured request `1`, warmup `0`, timeout `900s` |
 | Direct workload | `bench_serving request --prompt-len 10580 --output-len 1 --warmup 0 --iters 1 --seed 42` under `nsys profile` |
 

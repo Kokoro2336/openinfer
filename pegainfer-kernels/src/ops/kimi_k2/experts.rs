@@ -2683,7 +2683,7 @@ mod tests {
         const BLOCK_SIZE: usize = 8;
         let reference_dir = std::env::var("PEGAINFER_KIMI_MARLIN_WNA16_REFERENCE")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp/kimi_marlin_wna16_reference"));
+            .unwrap_or_else(|_| std::env::temp_dir().join("kimi_marlin_wna16_reference"));
         let w13_ref_path = reference_dir.join("w13_out_bf16.bin");
         let route_ref_path = reference_dir.join("route_output_bf16.bin");
         let final_ref_path = reference_dir.join("final_bf16.bin");

@@ -47,8 +47,8 @@
 ### Step 4: Verify
 
 - `cargo fmt --all --check` passed.
-- `PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=/data/code/workspace-rustllm/pegainfer/.venv/bin/python3 cargo check --release -p pegainfer-kimi-k2 --features kimi-k2 --tests` passed.
-- `PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=/data/code/workspace-rustllm/pegainfer/.venv/bin/python3 cargo check --release -p pegainfer-kimi-k2 --lib` passed after gating Kimi runtime/weights exports behind the crate `kimi-k2` feature.
+- `PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=$LOCAL_PEGAINFER_DIR/.venv/bin/python3 cargo check --release -p pegainfer-kimi-k2 --features kimi-k2 --tests` passed.
+- `PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=$LOCAL_PEGAINFER_DIR/.venv/bin/python3 cargo check --release -p pegainfer-kimi-k2 --lib` passed after gating Kimi runtime/weights exports behind the crate `kimi-k2` feature.
 
 ## Debrief
 

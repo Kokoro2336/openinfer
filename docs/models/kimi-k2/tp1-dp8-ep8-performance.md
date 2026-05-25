@@ -53,7 +53,7 @@ export RESULT_ROOT=/path/to/result-root
 export TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python
 ```
 
-Build on an H20 node:
+Build on an <H20_NODE>:
 
 ```bash
 cd "$PEGAINFER_DIR"

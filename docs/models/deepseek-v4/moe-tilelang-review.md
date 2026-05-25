@@ -43,7 +43,7 @@
 
 ### Step 1: Inspect official DeepSeek TileKernels MoE directory
 - Cloned the official repository for local inspection:
-  - `git clone --depth 1 https://github.com/deepseek-ai/TileKernels.git /tmp/deepseek-tilekernels`
+  - `git clone --depth 1 https://github.com/deepseek-ai/TileKernels.git $RESULT_ROOT/deepseek-tilekernels`
   - inspected commit `36d9e45d38e204ebb87e6f6e833821eee0482fe5`.
 - Official `tile_kernels/moe/` exports:
   - `top2_sum_gate` and `topk_gate` for routing selection;
@@ -56,7 +56,7 @@
   - `get_fused_mapping_kernel.py` builds `pos_to_expert`, `pos_to_token`, `pos_to_token_topk`, `token_topk_to_pos`, `expert_start`, `expert_end`, and `num_tokens_per_expert`. This is the routing metadata needed to execute only packed token slices per expert.
   - `expand_to_fused_kernel.py` copies token activations into the expanded expert-major layout, with an optional scale-factor path for quantized activations.
   - `reduce_fused_kernel.py` gathers expert outputs back to token order and applies top-k weights.
-- The checked model config at `/data/DeepSeek-V4-Flash/config.json` has:
+- The checked model config at `$MODEL_DIR/config.json` has:
   - `n_routed_experts=256`
   - `n_shared_experts=1`
   - `num_experts_per_tok=6`
@@ -130,7 +130,7 @@ Result: the most likely MoE problem is not the `sqrtsoftplus` math itself for no
 
 ```bash
 PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
-  --model-path /data/DeepSeek-V4-Flash --format json \
+  --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
@@ -147,7 +147,7 @@ nsys profile --stats=false --force-overwrite=true \
   --delay=34 --duration=14 \
   -o target/profiling/dsv4_moe_packed_decode_1x32_direct \
   target/release/bench_serving \
-  --model-path /data/DeepSeek-V4-Flash --format json \
+  --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
@@ -228,7 +228,7 @@ cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
 
 ```bash
 PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
-  --model-path /data/DeepSeek-V4-Flash --format json \
+  --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
@@ -242,7 +242,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
 
 ```bash
 PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
-  --model-path /data/DeepSeek-V4-Flash \
+  --model-path $MODEL_DIR \
   --ground-truth test_data/deepseek-v4-ground-truth.json \
   --offset 0 --limit 1 --max-new-tokens 64
 ```
@@ -252,7 +252,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
 
 ```bash
 PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
-  --model-path /data/DeepSeek-V4-Flash \
+  --model-path $MODEL_DIR \
   --ground-truth test_data/deepseek-v4-ground-truth.json \
   --max-new-tokens 64
 ```
@@ -276,7 +276,7 @@ nsys profile --stats=false --force-overwrite=true \
   --delay=34 --duration=12 \
   -o target/profiling/dsv4_rank_thread_decode_1x32_direct \
   target/release/bench_serving \
-  --model-path /data/DeepSeek-V4-Flash --format json \
+  --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
@@ -307,7 +307,7 @@ cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
 
 ```bash
 PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
-  --model-path /data/DeepSeek-V4-Flash --format json \
+  --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
@@ -321,7 +321,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
 
 ```bash
 PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
-  --model-path /data/DeepSeek-V4-Flash \
+  --model-path $MODEL_DIR \
   --ground-truth test_data/deepseek-v4-ground-truth.json \
   --max-new-tokens 64
 ```
@@ -345,7 +345,7 @@ nsys profile --stats=false --force-overwrite=true \
   --delay=34 --duration=12 \
   -o target/profiling/dsv4_persistent_workers_decode_1x32_direct \
   target/release/bench_serving \
-  --model-path /data/DeepSeek-V4-Flash --format json \
+  --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
@@ -417,7 +417,7 @@ PEGAINFER_DSV4_NVTX=1 nsys profile --stats=false --force-overwrite=true \
   --delay=34 --duration=12 \
   -o target/profiling/dsv4_rank_stage_proof \
   target/release/bench_serving \
-  --model-path /data/DeepSeek-V4-Flash --format json \
+  --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 
 nsys export --type sqlite --force-overwrite=true \
@@ -463,11 +463,11 @@ nsys export --type sqlite --force-overwrite=true \
 cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
 
 PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- \
-  --model-path /data/DeepSeek-V4-Flash --format json \
+  --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 
 PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- \
-  --model-path /data/DeepSeek-V4-Flash \
+  --model-path $MODEL_DIR \
   --ground-truth test_data/deepseek-v4-ground-truth.json \
   --max-new-tokens 64
 ```
@@ -495,7 +495,7 @@ nsys profile --stats=false --force-overwrite=true \
   --delay=34 --duration=12 \
   -o target/profiling/dsv4_decode_direct_topk_moe_1x32 \
   target/release/bench_serving \
-  --model-path /data/DeepSeek-V4-Flash --format json \
+  --model-path $MODEL_DIR --format json \
   request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 
 nsys export --type sqlite --force-overwrite=true \

@@ -7,17 +7,17 @@
 ## Source Map
 
 - vLLM checkouts:
-  - `/root/develop/yingshan/vllm` on `h20-100` was readable from the main shell and matches the vLLM V0 files already used for Kimi fixture work.
-  - A sub-agent also read `/data/code/pega-ci/vllm`, whose V1 layout places MLA code under `vllm/model_executor/layers/mla.py` and `vllm/model_executor/layers/attention/mla_attention.py`. The operator structure is consistent, but file names differ.
+  - `$VLLM_DIR_ALT` on `H20 node` was readable from the main shell and matches the vLLM V0 files already used for Kimi fixture work.
+  - A sub-agent also read `$LOCAL_VLLM_DIR`, whose V1 layout places MLA code under `vllm/model_executor/layers/mla.py` and `vllm/model_executor/layers/attention/mla_attention.py`. The operator structure is consistent, but file names differ.
 - Kimi text model uses vLLM `DeepseekV2Model` / `DeepseekV3ForCausalLM`; Kimi-VL only wraps the language model and is out of scope.
 - Main vLLM files:
-  - `/root/develop/yingshan/vllm/vllm/model_executor/models/deepseek_v2.py`
-  - `/root/develop/yingshan/vllm/vllm/attention/backends/mla/common.py`
-  - `/root/develop/yingshan/vllm/vllm/attention/backends/flashmla.py`
-  - `/root/develop/yingshan/vllm/vllm/model_executor/layers/fused_moe/fused_marlin_moe.py`
-  - `/root/develop/yingshan/vllm/vllm/model_executor/layers/fused_moe/layer.py`
-  - `/root/develop/yingshan/vllm/csrc/cache_kernels.cu`
-  - `/root/develop/yingshan/vllm/csrc/moe/*`
+  - `$VLLM_DIR_ALT/vllm/model_executor/models/deepseek_v2.py`
+  - `$VLLM_DIR_ALT/vllm/attention/backends/mla/common.py`
+  - `$VLLM_DIR_ALT/vllm/attention/backends/flashmla.py`
+  - `$VLLM_DIR_ALT/vllm/model_executor/layers/fused_moe/fused_marlin_moe.py`
+  - `$VLLM_DIR_ALT/vllm/model_executor/layers/fused_moe/layer.py`
+  - `$VLLM_DIR_ALT/csrc/cache_kernels.cu`
+  - `$VLLM_DIR_ALT/csrc/moe/*`
 - PegaInfer files:
   - `pegainfer-kimi-k2/src/direct/worker.rs`
   - `pegainfer-kimi-k2/src/batch_decode_trace.rs`
@@ -131,20 +131,20 @@ Validation:
 cargo fmt --all --check
 PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins
 PEGAINFER_CUDA_SM=90a cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- \
-  trace --source static --batch-size 4 --kv-len 1024 --out /tmp/kimi_decode_trace_fixed_bs4_kv1024.json
+  trace --source static --batch-size 4 --kv-len 1024 --out $RESULT_ROOT/kimi_decode_trace_fixed_bs4_kv1024.json
 ```
 
-H20 validation for the fused-qkv patch used the same `cargo check` and static trace command under `/root/develop/xingming/pegainfer-kimi-k2-main` with `PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python`; output was `calls=1886`, `gemm_graphsafe=367`, and `kimi_mla_split_qkv_a=61`.
+H20 validation for the fused-qkv patch used the same `cargo check` and static trace command under `$PEGAINFER_DIR` with `PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python`; output was `calls=1886`, `gemm_graphsafe=367`, and `kimi_mla_split_qkv_a=61`.
 
 Runtime model-report validation on H20:
 
 ```bash
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python \
 cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_model_report -- \
   decode --source runtime --batch-size 4 --kv-len 28 --iters 1 --format text \
-  --out /tmp/kimi_runtime_model_report_bs4_kv28_fixed_trace_v2.json
+  --out $RESULT_ROOT/kimi_runtime_model_report_bs4_kv28_fixed_trace_v2.json
 ```
 
 The fused-qkv runtime report produced `total_schedule_calls=1886`, `measured_schedule_calls=1642`, `missing_schedule_calls=244`, and measured subset `136.549ms`. Missing providers are explicit:
@@ -181,7 +181,7 @@ Historical `kimi_graph_probe --probe routed-bridge-compare` (since retired, see 
 
 ## TP-Only MoE Cadence Probe
 
-Hypatia 对 `/data/code/pega-ci/vllm` 的 Kimi/DeepSeekV3 TP-only path 做了源码对照：vLLM decode 是 embedding `1` 次、attention `61` 次、dense layer0 `1` 次、MoE final `60` 次 BF16 all-reduce，总计 `123` 次 BF16 all-reduce，MoE TP-only path 不使用 reduce-scatter。PegaInfer 当前是同样 `123` 次 logical hidden all-reduce，再额外加 `60` 次 routed `repeat+RS` bridge。
+Hypatia 对 `$LOCAL_VLLM_DIR` 的 Kimi/DeepSeekV3 TP-only path 做了源码对照：vLLM decode 是 embedding `1` 次、attention `61` 次、dense layer0 `1` 次、MoE final `60` 次 BF16 all-reduce，总计 `123` 次 BF16 all-reduce，MoE TP-only path 不使用 reduce-scatter。PegaInfer 当前是同样 `123` 次 logical hidden all-reduce，再额外加 `60` 次 routed `repeat+RS` bridge。
 
 把 PegaInfer decode MoE 临时改成 vLLM TP-only final all-reduce 后，H20 correctness 通过但性能回退：
 

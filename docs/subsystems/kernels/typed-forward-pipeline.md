@@ -50,9 +50,9 @@
 
 ### Step 4: Verify
 
-- `PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=/data/code/workspace-rustllm/pegainfer/.venv/bin/python3 cargo check --release -p pegainfer-kimi-k2 --features kimi-k2 --tests` passed.
-- `PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=/data/code/workspace-rustllm/pegainfer/.venv/bin/python3 cargo check --release -p pegainfer-kimi-k2 --lib` passed after gating runtime/weights exports behind `kimi-k2`.
-- `PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=/data/code/workspace-rustllm/pegainfer/.venv/bin/python3 cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins` passed after migrating report harness inputs to typed Kimi kernel wrappers.
+- `PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=$LOCAL_PEGAINFER_DIR/.venv/bin/python3 cargo check --release -p pegainfer-kimi-k2 --features kimi-k2 --tests` passed.
+- `PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=$LOCAL_PEGAINFER_DIR/.venv/bin/python3 cargo check --release -p pegainfer-kimi-k2 --lib` passed after gating runtime/weights exports behind `kimi-k2`.
+- `PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=$LOCAL_PEGAINFER_DIR/.venv/bin/python3 cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins` passed after migrating report harness inputs to typed Kimi kernel wrappers.
 - Final audit replaced the remaining worker load `debug_assert_eq!` rank/report checks with release `ensure!` errors and confirmed the Kimi worker/MLA typed path has no `AsGemmWeight`, `AsNormWeight`, `typed_forward`, or `TypedDecodeScratch` remnants.
 
 ## Debrief

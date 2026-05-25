@@ -52,15 +52,15 @@
 - Rebuilt the disposable validation worktree at `<validation-worktree>` from local `HEAD` commit `612850f`, then rsynced the current working tree changes over it.
 - Copied initialized FlashInfer headers from `<validation-checkout>/third_party/flashinfer` into the clean worktree's `crates/pegainfer-kernels/third_party/flashinfer` directory.
 - `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report` passed.
-- `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --no-cupti --iters 1 --contexts 1024 --batch-sizes 1 --variants non_partition --out /tmp/qwen3_kernel_op_report_min.json` passed.
-- `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compare --base /tmp/qwen3_kernel_op_report_min.json --new /tmp/qwen3_kernel_op_report_min.json` passed with `warnings=0 failures=0`.
-- `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compose --input /tmp/qwen3_kernel_op_report_min.json --batch-size 1 --context 1024 --out /tmp/qwen3_kernel_composition_min.json` passed.
+- `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --no-cupti --iters 1 --contexts 1024 --batch-sizes 1 --variants non_partition --out $RESULT_ROOT/qwen3_kernel_op_report_min.json` passed.
+- `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compare --base $RESULT_ROOT/qwen3_kernel_op_report_min.json --new $RESULT_ROOT/qwen3_kernel_op_report_min.json` passed with `warnings=0 failures=0`.
+- `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compose --input $RESULT_ROOT/qwen3_kernel_op_report_min.json --batch-size 1 --context 1024 --out $RESULT_ROOT/qwen3_kernel_composition_min.json` passed.
 - CUPTI minimal validation passed with `non_partition,split_kv_256x64` at `bs=1,ctx=1024`; the report contained 2 cases, 1 selection, CUPTI metrics for both cases, and selected `split_kv_256x64`.
 - Default package build without the report feature also passed: `PEGAINFER_CUDA_SM=120 cargo build --release -p pegainfer-qwen3-4b`.
 
 ### Step 6: Full GPU manifest run
 - Ran the full manifest command on the validation worktree:
-  - `PEGAINFER_CUDA_SM=120 time cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --out /tmp/qwen3_kernel_report_full.json`
+  - `PEGAINFER_CUDA_SM=120 time cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- run --out $RESULT_ROOT/qwen3_kernel_report_full.json`
 - Result:
   - `126` cases: `6` batch sizes x `7` context lengths x `3` variants.
   - `42` selections.
@@ -69,7 +69,7 @@
   - Runtime: `2:42.83 elapsed`.
   - Manifest hash: `62aada084b61795862c5d4dd23fa89d1`.
 - Self-compare passed:
-  - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compare --base /tmp/qwen3_kernel_report_full.json --new /tmp/qwen3_kernel_report_full.json`
+  - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compare --base $RESULT_ROOT/qwen3_kernel_report_full.json --new $RESULT_ROOT/qwen3_kernel_report_full.json`
   - Output: `kernel report compare complete: warnings=0 failures=0`.
 - Representative selections:
   - `bs=1,ctx=1024`: `split_kv_256x64`.
@@ -82,7 +82,7 @@
   - `non_partition`: `15`.
   - `split_kv_512x64`: `7`.
 - Composed the full report for `bs=1,ctx=4096`:
-  - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compose --input /tmp/qwen3_kernel_report_full.json --batch-size 1 --context 4096 --out /tmp/qwen3_kernel_composition_full_bs1_ctx4096.json`
+  - `PEGAINFER_CUDA_SM=120 cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_kernel_report -- compose --input $RESULT_ROOT/qwen3_kernel_report_full.json --batch-size 1 --context 4096 --out $RESULT_ROOT/qwen3_kernel_composition_full_bs1_ctx4096.json`
   - Output total: cold-L2 `958.473us`, `split_kv_256x64` repeated across 36 layers.
   - Coverage note still applies: only `paged_decode_attention` is included; linear, MLP, norm, embedding, and sampling are not covered yet.
 - Preserved the generated JSONs under:
@@ -358,7 +358,7 @@
   - `qwen3_kernel_report` no longer uses `Option::map(...).unwrap_or_else(...)` or a redundant selector-key clone.
 - Local checks passed:
   - `cargo fmt --all --check`
-  - `cargo metadata --no-deps --format-version 1 >/tmp/pegainfer_metadata.json`
+  - `cargo metadata --no-deps --format-version 1 >$RESULT_ROOT/pegainfer_metadata.json`
   - `git diff --check`
 - GPU release clippy passed on the synced validation worktree:
   - `PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=<python-venv>/bin/python cargo clippy --release -p pegainfer-kernels --all-targets -- -D warnings`
@@ -396,7 +396,7 @@
 - Validation:
   - `cargo check --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report` passed.
   - `cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text` passed and wrote JSON plus DOT.
-  - `dot -Tsvg target/model_reports/qwen3-4b/decode-bs16-kv2048.dot -o /tmp/qwen3-model-report.svg` passed.
+  - `dot -Tsvg target/model_reports/qwen3-4b/decode-bs16-kv2048.dot -o $RESULT_ROOT/qwen3-model-report.svg` passed.
   - JSON audit confirmed schema `2`, default `iters=32`, and `stddev_us` / `p99_us` fields in by-op rows.
   - `cargo fmt --all --check`, `git diff --check`, and `cargo check --release -p pegainfer-qwen3-4b --lib` passed.
 
@@ -418,7 +418,7 @@
   - `target/release/qwen3_decode_context --model-path models/Qwen3-4B --contexts 1024 --iters 20`
   - Result: `p50=11.3781ms`, `avg=11.6660ms`.
 - Built a detached baseline worktree at `HEAD=3ffe745` and ran the same fixed-context decode probe on the same GPU/model:
-  - `PEGAINFER_TRITON_PYTHON=/data/code/workspace-rustllm/pegainfer/.venv/bin/python cargo run --release -p pegainfer-qwen3-4b --bin qwen3_decode_context --manifest-path /tmp/pegainfer-bench-baseline/Cargo.toml -- --model-path /data/code/workspace-rustllm/pegainfer/models/Qwen3-4B --contexts 1024 --iters 20`
+  - `PEGAINFER_TRITON_PYTHON=$LOCAL_PEGAINFER_DIR/.venv/bin/python cargo run --release -p pegainfer-qwen3-4b --bin qwen3_decode_context --manifest-path $RESULT_ROOT/pegainfer-bench-baseline/Cargo.toml -- --model-path $LOCAL_PEGAINFER_DIR/models/Qwen3-4B --contexts 1024 --iters 20`
   - Result: `p50=11.3610ms`, `avg=11.6449ms`.
 - Interpretation: eager DAG is not measurable as a decode overhead in this probe. Current worktree vs same-machine `HEAD` baseline is `+0.0171ms` p50 (`+0.15%`), well under the benchmark-regression `2%` TPOT threshold.
 - The standard `bench_serving snapshot --warmup 5 --iters 20` could not complete because `prefill-heavy (10000,1)` hit CUDA OOM on this run. The existing tracked `bench_snapshots/rtx-5090/qwen3-4b.json` was restored from backup after the failed snapshot attempt.
@@ -436,7 +436,7 @@
   - `cargo test --release -p pegainfer-qwen3-4b --lib`
   - `cargo run --release -p pegainfer-qwen3-4b --features kernel-report --bin qwen3_model_report -- decode --batch-size 16 --kv-len 2048 --format text`
 - Qwen3-4B e2e was run with an absolute model path:
-  - `PEGAINFER_TEST_MODEL_PATH=/data/code/workspace-rustllm/pegainfer/models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture`
+  - `PEGAINFER_TEST_MODEL_PATH=$LOCAL_PEGAINFER_DIR/models/Qwen3-4B cargo test --release -p pegainfer-qwen3-4b --test e2e -- --nocapture`
   - Current worktree produced greedy-output mismatches on repeated runs.
   - A detached baseline worktree at `HEAD=3ffe745` reproduced the same Kanye prompt mismatch, so this e2e failure is not introduced by the eager-DAG/model-report changes.
 
@@ -446,7 +446,7 @@
 - **Pitfalls encountered**:
   - `cargo bench` appends a trailing `--bench` argument to `harness=false` binaries. That made the new `clap` parser fail and confirmed this should be a real bin, not a bench target.
   - A normal `src/bin` target cannot use dev-dependencies. Making report-only dependencies ordinary non-optional dependencies would pull CUPTI into default Qwen3/server builds, so the bin now uses `required-features = ["kernel-report"]`.
-  - The first attempted full-run command removed `/tmp/qwen3_kernel_report_full.json` before running. Future profiling commands should not delete prior JSONs; save new reports under a timestamped or explicit report directory.
+  - The first attempted full-run command removed `$RESULT_ROOT/qwen3_kernel_report_full.json` before running. Future profiling commands should not delete prior JSONs; save new reports under a timestamped or explicit report directory.
   - The validation checkout is dirty and lacked the local commit object, so validation used a bundle-derived clean worktree plus rsync of current changes.
   - FlashInfer's JIT environment treats `FLASHINFER_JIT_VERBOSE=1` as a debug build switch for backward compatibility. The first FMHA v2 cache contained `-O0 -G`; those results were discarded, and the release measurement used a separate cache directory with explicit debug flags disabled.
   - The official `flashinfer-python 0.6.6` package did not expose `trtllm_fmha_v2_prefill`. Its public `trtllm-gen` wrapper also has a plan-argument bug with explicit max lengths and then reports unsupported architecture on RTX 5090 once that is worked around.

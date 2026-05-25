@@ -12,8 +12,8 @@
 
 | Item | Target / baseline |
 | --- | --- |
-| Machine | `h20-100`, 8× NVIDIA H20 |
-| Model | `/data/models/Kimi-K2.5` |
+| Machine | `H20 node`, 8× NVIDIA H20 |
+| Model | `$MODEL_DIR` |
 | Shape | DP1 TP8 EP8 |
 | Primary workload | `input_len=1`, `output_len=128`, `ignore-eos`, `bs=64` |
 | vLLM baseline | TP1 DP8 EP8, `vllm bench serve`, output `583.9 tok/s`, TPOT median `109.00ms`, TPOT p99 `109.76ms` |
@@ -79,15 +79,15 @@ baseline.
 Server:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep -- \
-  --model-path /data/models/Kimi-K2.5 \
+$CARGO_BIN_DIR/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep -- \
+  --model-path $MODEL_DIR \
   --port 8124 \
   --cuda-graph true
 ```
@@ -95,14 +95,14 @@ PEGAINFER_KIMI_PARALLEL=tp8dp1 \
 Client:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 COMMIT=$(git rev-parse --short HEAD)
-mkdir -p /tmp/kimi-bs64-baseline
-source /root/develop/xingming/vllm_test/.venv/bin/activate
+mkdir -p $RESULT_ROOT/kimi-bs64-baseline
+source $VLLM_DIR/.venv/bin/activate
 vllm bench serve \
   --backend openai \
-  --model /data/models/Kimi-K2.5 \
-  --tokenizer /data/models/Kimi-K2.5 \
+  --model $MODEL_DIR \
+  --tokenizer $MODEL_DIR \
   --trust-remote-code \
   --base-url http://127.0.0.1:8124 \
   --endpoint /v1/completions \
@@ -118,9 +118,9 @@ vllm bench serve \
   --metric-percentiles 50,95,99 \
   --save-result \
   --save-detailed \
-  --result-dir /tmp/kimi-bs64-baseline \
+  --result-dir $RESULT_ROOT/kimi-bs64-baseline \
   --result-filename pegainfer_tp8_pplx_bs64_${COMMIT}.json \
-  2>&1 | tee /tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_${COMMIT}.log
+  2>&1 | tee $RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_${COMMIT}.log
 ```
 
 Required report fields:
@@ -145,20 +145,20 @@ service pressure test; it exists to explain service deltas with a stable
 engine-side shape.
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 COMMIT=$(git rev-parse --short HEAD)
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
+$CARGO_BIN_DIR/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
   --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph true \
   --format json \
-  --out /tmp/kimi_pplx_tp8_micro_bs64_o128_${COMMIT}.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_micro_bs64_o128_${COMMIT}.json \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 ```
 
@@ -168,18 +168,18 @@ Run this before accepting a performance change, and compare it with the TP8 NCCL
 reference from [pplx-ep-correctness.md](pplx-ep-correctness.md):
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+$CARGO_BIN_DIR/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
+  --model-path $MODEL_DIR \
   --cuda-graph false \
   --format json \
-  --out /tmp/kimi_pplx_tp8_correctness64.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_correctness64.json \
   request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
@@ -188,19 +188,19 @@ comparison. The output5 probe catches early PPLX/NCCL path drift, but R5 showed
 router GEMM precision changes can pass output5 and diverge later.
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 COMMIT=$(git rev-parse --short HEAD)
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+$CARGO_BIN_DIR/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
+  --model-path $MODEL_DIR \
   --cuda-graph true \
   --format json \
-  --out /tmp/kimi_pplx_tp8_math_correctness_bs64_o128_${COMMIT}.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_math_correctness_bs64_o128_${COMMIT}.json \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 ```
 
@@ -209,26 +209,26 @@ PEGAINFER_KIMI_PARALLEL=tp8dp1 \
 | ID | Date | Commit | Area | Change | Correctness gate | bs64 result | Decision |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | B0 | 2026-05-25 | `72c770b` | correctness | TP8 PPLX baseline fixed; no performance claim | TP8 NCCL/PPLX 64-token hash `4920f088c2338236` | Not measured | Keep as ground truth |
-| B1 | 2026-05-25 | `d639e55` code, `df1cd18` command doc | scheduler / service profile | Canonical bs64 pressure baseline before performance work | No code change after B0; PPLX correctness baseline remains `4920f088c2338236` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.json`: output `137.51 tok/s`, TPOT p50/p95/p99 `26.40/28.13/28.46ms`, TTFT p50/p99 `54.76/58.68s`, 256/256 success | Keep as profile baseline; first optimization should address 4-row scheduling/admission before kernel work |
-| O1 | 2026-05-25 | this commit | scheduler / decode arena | Raise DP1 TP8 admission to bs64; allocate decode arenas lazily in `1/2/4/8/16/32/64` buckets; preflight arena allocation on all TP ranks before prefill collectives | `/tmp/kimi_pplx_tp8_correctness64_o1_bucket.json`: TP8 PPLX 64-token hash `4920f088c2338236` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o1-bucket-07d6a40.json`: output `145.18 tok/s`, TPOT p50/p95/p99 `195.07/221.08/224.72ms`, TTFT p50/p99 `31.00/35.76s`, 256/256 success | Keep as bs64 enabling baseline; not enough for vLLM target, next profile must attack bs64 kernel/communication cost |
-| C1 | 2026-05-25 | this commit | correctness / PPLX MoE | Align TP8 PPLX with TP8 NCCL for active bs64 decode: active MoE rows, TP8-only duplicate-source canonicalization, NCCL-layout local expert compute before PPLX combine | `/tmp/kimi_pplx_tp8_active64_o5_after_review.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 per-index token mismatches; both paths hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | Not a performance optimization; PPLX correctness probe TPOT p50 `110.14ms` vs NCCL `97.53ms`; rerun canonical bs64 pressure after this correctness commit | Keep as the new correctness baseline before further optimization |
-| P1 | 2026-05-25 | documentation only | service / scheduler profile | Profile `00b3f1f` after C1 with the canonical bs64 command and an in-process bs64/output128 microbench | No code change after C1; C1 correctness baseline remains the gate | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.json`: output `353.91 tok/s`, TPOT p50/p95/p99 `146.15/172.83/175.10ms`, TTFT p50/p99 `4.58/10.24s`, 256/256 success; in-process warm1 steady TPOT p50 `107.76ms` | Keep as profile baseline; next optimization should target serial first-token prefill without changing token trace |
-| O2 | 2026-05-25 | this commit | scheduler / MLA prefill | Replace prompt_len=1 first-token MLA attention with the exact single-token V path; keep microbatch at 1 because seq_len>1 drifted | `/tmp/kimi_pplx_tp8_c1fast_mb1_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.json`: output `414.28 tok/s`, TPOT p50/p95/p99 `133.36/147.74/149.42ms`, TTFT p50/p99 `2.76/6.90s`, 256/256 success | Keep as an incremental first-token optimization; still below vLLM, next work must make batch>1 prompt_len=1 prefill correct or reduce PPLX TPOT |
-| O3 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Reuse prompt_len=1 dense/shared/router/Marlin scratch for the single-row prefill path, and widen the fixed admission coalesce window to `100ms` so bs64 pressure is admitted as one wave | `/tmp/kimi_pplx_tp8_o3_scratch_coalesce_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json`: output `492.34 tok/s`, TPOT p50/p95/p99 `121.05/124.99/125.58ms`, TTFT p50/p99 `0.67/3.96s`, 256/256 success | Keep as a measured bs64 improvement; still below vLLM, next work should attack service TPOT/ITL and PPLX steady decode |
-| O5 | 2026-05-25 | this commit | PPLX / MoE stream overlap | Start the PPLX decode router on the aux stream immediately after RMSNorm, matching the NCCL decode overlap window instead of waiting for shared expert/all-reduce | `/tmp/kimi_pplx_tp8_o5_router_overlap_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.json`: output `509.89 tok/s`, TPOT p50/p95/p99 `116.53/120.45/121.44ms`, TTFT p50/p99 `0.67/3.95s`, 256/256 success | Keep as a measured PPLX decode improvement; still below vLLM, next work should remove PPLX TP8 dispatch/copy overhead |
-| O7 | 2026-05-25 | this commit | PPLX / dispatch recv | Add a metadata/counts-only `dispatch_recv` path for TP8 decode, where local experts no longer consume the dispatched hidden payload | `/tmp/kimi_pplx_tp8_counts_recv_short_v2.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_counts_recv_v2.json`: output `511.78 tok/s`, TPOT p50/p95/p99 `115.83/120.26/121.26ms`, TTFT p50/p99 `0.67/4.07s`, 256/256 success; in-process bs64/o128 reached `589.98 tok/s`, TPOT p50 `101.58ms` | Keep as a measured PPLX decode improvement; still below vLLM service target, next work should remove dispatch-send payload or compact scatter |
-| O8 | 2026-05-25 | this commit | compute / RMSNorm fusion | Fuse attention residual add with post-attention RMSNorm using a Kimi-specific kernel that first materializes the BF16-rounded residual sum | `/tmp/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json` vs `/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json`: 0 output128 mismatches; hash counter `32x 82a791616c737442`, `16x 4ae8834e96c7d195`, `16x 24b2b3856ac0ea3a` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fused_addrms_round.json`: output `516.44 tok/s`, TPOT p50/p95/p99 `114.92/118.95/119.57ms`, TTFT p50/p95/p99 `0.66/3.81/3.97s`, 256/256 success; in-process bs64/o128 steady TPOT p50 `101.57ms` | Keep. This recovers the add+rms launch/memory win that R4 attempted, without changing token traces. |
-| O9 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Let prompt_len=1 first-token prefill run in microbatch `2`, using row-wise `per_token` GEMM/router/all-reduce boundaries that preserve the decode math order | `/tmp/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o5_probe.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; `/tmp/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o128_probe.json` vs O8/O7 output128: 0 mismatches | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_per_token_mb2_candidate.json`: output `523.88 tok/s`, TPOT p50/p95/p99 `113.88/117.51/118.37ms`, TTFT p50/p95/p99 `0.50/3.75/3.86s`, 256/256 success; in-process bs64/o128 steady TPOT p50 `101.68ms` | Keep. This is a small service win that preserves token traces; larger microbatches remain rejected until layer parity is proven. |
-| O10 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Allocate bs64 decode arena and warm prompt_len=1 before the service is ready, then run prompt_len=1 at microbatch `64` under the recorded large-batch drift gate | Final candidate records drift: o5 `48/64` mismatches vs TP8 NCCL; o128 `64/64` mismatches vs O8/O7. Exact reference point: mb8 was `0/64` on o5 and o128 but slower. | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_candidate.json`: output `557.71 tok/s`, TPOT p50/p95/p99 `110.95/115.30/115.34ms`, TTFT p50/p95/p99 `473.94/504.25/506.18ms`, 256/256 success; in-process bs64/o128 first decode p50 `104.61ms` | Keep as a drift-recorded performance baseline, not an exact-token baseline; still below vLLM output `583.9 tok/s`, so the next work must target steady TPOT/ITL. |
-| O11 | 2026-05-25 | this commit | PPLX / dispatch send | Add TP route-only `dispatch_send` for the PPLX counts-only TP8 decode path, preserving route metadata and worker sync while skipping the unused hidden payload copy | No extra drift over O10: pending-guard route-only o5 vs O10 `0/64`; route-only o128 vs O10 `0/64`. Drift remains recorded as o5 `48/64` vs TP8 NCCL and o128 `64/64` vs O8. | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_route_send_pending_guard.json`: output `564.49 tok/s`, TPOT p50/p95/p99 `110.54/111.60/111.60ms`, TTFT p50/p95/p99 `472.88/500.05/501.35ms`, 256/256 success; A2A split p50 `158.6us -> 135.1us` | Keep as a measured PPLX decode improvement; still below vLLM output `583.9 tok/s`, so continue with the remaining combine/scatter/GEMM profile items. |
+| B1 | 2026-05-25 | `d639e55` code, `df1cd18` command doc | scheduler / service profile | Canonical bs64 pressure baseline before performance work | No code change after B0; PPLX correctness baseline remains `4920f088c2338236` | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.json`: output `137.51 tok/s`, TPOT p50/p95/p99 `26.40/28.13/28.46ms`, TTFT p50/p99 `54.76/58.68s`, 256/256 success | Keep as profile baseline; first optimization should address 4-row scheduling/admission before kernel work |
+| O1 | 2026-05-25 | this commit | scheduler / decode arena | Raise DP1 TP8 admission to bs64; allocate decode arenas lazily in `1/2/4/8/16/32/64` buckets; preflight arena allocation on all TP ranks before prefill collectives | `$RESULT_ROOT/kimi_pplx_tp8_correctness64_o1_bucket.json`: TP8 PPLX 64-token hash `4920f088c2338236` | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o1-bucket-07d6a40.json`: output `145.18 tok/s`, TPOT p50/p95/p99 `195.07/221.08/224.72ms`, TTFT p50/p99 `31.00/35.76s`, 256/256 success | Keep as bs64 enabling baseline; not enough for vLLM target, next profile must attack bs64 kernel/communication cost |
+| C1 | 2026-05-25 | this commit | correctness / PPLX MoE | Align TP8 PPLX with TP8 NCCL for active bs64 decode: active MoE rows, TP8-only duplicate-source canonicalization, NCCL-layout local expert compute before PPLX combine | `$RESULT_ROOT/kimi_pplx_tp8_active64_o5_after_review.json` vs `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`: 0 per-index token mismatches; both paths hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | Not a performance optimization; PPLX correctness probe TPOT p50 `110.14ms` vs NCCL `97.53ms`; rerun canonical bs64 pressure after this correctness commit | Keep as the new correctness baseline before further optimization |
+| P1 | 2026-05-25 | documentation only | service / scheduler profile | Profile `00b3f1f` after C1 with the canonical bs64 command and an in-process bs64/output128 microbench | No code change after C1; C1 correctness baseline remains the gate | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.json`: output `353.91 tok/s`, TPOT p50/p95/p99 `146.15/172.83/175.10ms`, TTFT p50/p99 `4.58/10.24s`, 256/256 success; in-process warm1 steady TPOT p50 `107.76ms` | Keep as profile baseline; next optimization should target serial first-token prefill without changing token trace |
+| O2 | 2026-05-25 | this commit | scheduler / MLA prefill | Replace prompt_len=1 first-token MLA attention with the exact single-token V path; keep microbatch at 1 because seq_len>1 drifted | `$RESULT_ROOT/kimi_pplx_tp8_c1fast_mb1_o5.json` vs `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.json`: output `414.28 tok/s`, TPOT p50/p95/p99 `133.36/147.74/149.42ms`, TTFT p50/p99 `2.76/6.90s`, 256/256 success | Keep as an incremental first-token optimization; still below vLLM, next work must make batch>1 prompt_len=1 prefill correct or reduce PPLX TPOT |
+| O3 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Reuse prompt_len=1 dense/shared/router/Marlin scratch for the single-row prefill path, and widen the fixed admission coalesce window to `100ms` so bs64 pressure is admitted as one wave | `$RESULT_ROOT/kimi_pplx_tp8_o3_scratch_coalesce_o5.json` vs `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json`: output `492.34 tok/s`, TPOT p50/p95/p99 `121.05/124.99/125.58ms`, TTFT p50/p99 `0.67/3.96s`, 256/256 success | Keep as a measured bs64 improvement; still below vLLM, next work should attack service TPOT/ITL and PPLX steady decode |
+| O5 | 2026-05-25 | this commit | PPLX / MoE stream overlap | Start the PPLX decode router on the aux stream immediately after RMSNorm, matching the NCCL decode overlap window instead of waiting for shared expert/all-reduce | `$RESULT_ROOT/kimi_pplx_tp8_o5_router_overlap_o5.json` vs `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.json`: output `509.89 tok/s`, TPOT p50/p95/p99 `116.53/120.45/121.44ms`, TTFT p50/p99 `0.67/3.95s`, 256/256 success | Keep as a measured PPLX decode improvement; still below vLLM, next work should remove PPLX TP8 dispatch/copy overhead |
+| O7 | 2026-05-25 | this commit | PPLX / dispatch recv | Add a metadata/counts-only `dispatch_recv` path for TP8 decode, where local experts no longer consume the dispatched hidden payload | `$RESULT_ROOT/kimi_pplx_tp8_counts_recv_short_v2.json` vs `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_counts_recv_v2.json`: output `511.78 tok/s`, TPOT p50/p95/p99 `115.83/120.26/121.26ms`, TTFT p50/p99 `0.67/4.07s`, 256/256 success; in-process bs64/o128 reached `589.98 tok/s`, TPOT p50 `101.58ms` | Keep as a measured PPLX decode improvement; still below vLLM service target, next work should remove dispatch-send payload or compact scatter |
+| O8 | 2026-05-25 | this commit | compute / RMSNorm fusion | Fuse attention residual add with post-attention RMSNorm using a Kimi-specific kernel that first materializes the BF16-rounded residual sum | `$RESULT_ROOT/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json` vs `$RESULT_ROOT/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json`: 0 output128 mismatches; hash counter `32x 82a791616c737442`, `16x 4ae8834e96c7d195`, `16x 24b2b3856ac0ea3a` | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fused_addrms_round.json`: output `516.44 tok/s`, TPOT p50/p95/p99 `114.92/118.95/119.57ms`, TTFT p50/p95/p99 `0.66/3.81/3.97s`, 256/256 success; in-process bs64/o128 steady TPOT p50 `101.57ms` | Keep. This recovers the add+rms launch/memory win that R4 attempted, without changing token traces. |
+| O9 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Let prompt_len=1 first-token prefill run in microbatch `2`, using row-wise `per_token` GEMM/router/all-reduce boundaries that preserve the decode math order | `$RESULT_ROOT/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o5_probe.json` vs `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; `$RESULT_ROOT/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o128_probe.json` vs O8/O7 output128: 0 mismatches | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_per_token_mb2_candidate.json`: output `523.88 tok/s`, TPOT p50/p95/p99 `113.88/117.51/118.37ms`, TTFT p50/p95/p99 `0.50/3.75/3.86s`, 256/256 success; in-process bs64/o128 steady TPOT p50 `101.68ms` | Keep. This is a small service win that preserves token traces; larger microbatches remain rejected until layer parity is proven. |
+| O10 | 2026-05-25 | this commit | scheduler / prompt_len=1 prefill | Allocate bs64 decode arena and warm prompt_len=1 before the service is ready, then run prompt_len=1 at microbatch `64` under the recorded large-batch drift gate | Final candidate records drift: o5 `48/64` mismatches vs TP8 NCCL; o128 `64/64` mismatches vs O8/O7. Exact reference point: mb8 was `0/64` on o5 and o128 but slower. | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_candidate.json`: output `557.71 tok/s`, TPOT p50/p95/p99 `110.95/115.30/115.34ms`, TTFT p50/p95/p99 `473.94/504.25/506.18ms`, 256/256 success; in-process bs64/o128 first decode p50 `104.61ms` | Keep as a drift-recorded performance baseline, not an exact-token baseline; still below vLLM output `583.9 tok/s`, so the next work must target steady TPOT/ITL. |
+| O11 | 2026-05-25 | this commit | PPLX / dispatch send | Add TP route-only `dispatch_send` for the PPLX counts-only TP8 decode path, preserving route metadata and worker sync while skipping the unused hidden payload copy | No extra drift over O10: pending-guard route-only o5 vs O10 `0/64`; route-only o128 vs O10 `0/64`. Drift remains recorded as o5 `48/64` vs TP8 NCCL and o128 `64/64` vs O8. | `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_route_send_pending_guard.json`: output `564.49 tok/s`, TPOT p50/p95/p99 `110.54/111.60/111.60ms`, TTFT p50/p95/p99 `472.88/500.05/501.35ms`, 256/256 success; A2A split p50 `158.6us -> 135.1us` | Keep as a measured PPLX decode improvement; still below vLLM output `583.9 tok/s`, so continue with the remaining combine/scatter/GEMM profile items. |
 
 ### O11 PPLX Route-Only Dispatch Send
 
 Profile:
 
 ```text
-/tmp/kimi-profile/o10-steady/bs64_o64_graph_nodes.nsys-rep
-/tmp/kimi-profile/o10-steady/bs64_o64_graph_nodes_cuda_gpu_kern_sum_cuda_gpu_kern_sum.csv
+$RESULT_ROOT/kimi-profile/o10-steady/bs64_o64_graph_nodes.nsys-rep
+$RESULT_ROOT/kimi-profile/o10-steady/bs64_o64_graph_nodes_cuda_gpu_kern_sum_cuda_gpu_kern_sum.csv
 ```
 
 The O10 steady profile shows `a2a_dispatch_send_kernel` as a visible PPLX
@@ -275,25 +275,25 @@ target/release/pplx_a2a_bench \
 
 Results:
 
-- Full send: `/tmp/kimi-route-only/pplx_a2a_kimi_bs64_full_send_counts_recv.txt`;
+- Full send: `$RESULT_ROOT/kimi-route-only/pplx_a2a_kimi_bs64_full_send_counts_recv.txt`;
   `dispatch_send` p50/p95/p99 `73.25/78.30/82.21us`, max-rank split
   p50/p95/p99 `158.6/173.2/179.7us`.
 - Route-only send:
-  `/tmp/kimi-route-only/pplx_a2a_kimi_bs64_route_send_counts_recv.txt`;
+  `$RESULT_ROOT/kimi-route-only/pplx_a2a_kimi_bs64_route_send_counts_recv.txt`;
   `dispatch_send` p50/p95/p99 `46.11/49.38/52.58us`, max-rank split
   p50/p95/p99 `136.3/154.0/171.8us`.
 - Guarded repeat:
-  `/tmp/kimi-route-only/pplx_a2a_kimi_bs64_route_send_counts_recv_guarded.txt`;
+  `$RESULT_ROOT/kimi-route-only/pplx_a2a_kimi_bs64_route_send_counts_recv_guarded.txt`;
   `dispatch_send` p50/p95/p99 `45.60/49.09/51.42us`, max-rank split
   p50/p95/p99 `135.1/149.1/159.3us`.
 
 Correctness gate:
 
 ```text
-/tmp/kimi-route-only/kimi_pplx_tp8_route_send_mb64_bs64_o5_probe.json
-/tmp/kimi-route-only/kimi_pplx_tp8_route_send_mb64_bs64_o128_probe.json
-/tmp/kimi-route-only/kimi_pplx_tp8_route_send_guarded_mb64_bs64_o5_probe.json
-/tmp/kimi-route-only/kimi_pplx_tp8_route_send_pending_guard_mb64_bs64_o5_probe.json
+$RESULT_ROOT/kimi-route-only/kimi_pplx_tp8_route_send_mb64_bs64_o5_probe.json
+$RESULT_ROOT/kimi-route-only/kimi_pplx_tp8_route_send_mb64_bs64_o128_probe.json
+$RESULT_ROOT/kimi-route-only/kimi_pplx_tp8_route_send_guarded_mb64_bs64_o5_probe.json
+$RESULT_ROOT/kimi-route-only/kimi_pplx_tp8_route_send_pending_guard_mb64_bs64_o5_probe.json
 ```
 
 Recorded comparison counts:
@@ -315,8 +315,8 @@ Performance gate:
 Canonical bs64 service result:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_route_send_pending_guard.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_route_send_pending_guard.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_route_send_pending_guard.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_route_send_pending_guard.json
 ```
 
 Observed:
@@ -341,8 +341,8 @@ the same test shape.
 Profile:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.json
 ```
 
 Observed:
@@ -373,8 +373,8 @@ canonical bs64 pressure command.
 Profile:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_d639e55.json
 ```
 
 Observed:
@@ -399,22 +399,22 @@ communication cost.
 Microbench:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
 cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph true \
   --format json \
-  --out /tmp/kimi_pplx_tp8_o1_bucket_micro_bs64.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_o1_bucket_micro_bs64.json \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 0 --iters 1
 Result:
 
-- Output path: `/tmp/kimi_pplx_tp8_o1_bucket_micro_bs64.json`.
+- Output path: `$RESULT_ROOT/kimi_pplx_tp8_o1_bucket_micro_bs64.json`.
 - Workload confirmed `concurrency=64`, `output_len=128`, all `64` traces had
   length `128`.
 - In-process wall throughput, computed as `64 * 128 / max_e2e`, was about
@@ -424,18 +424,18 @@ Result:
 Correctness gate:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
 cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph false \
   --format json \
-  --out /tmp/kimi_pplx_tp8_correctness64_o1_bucket.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_correctness64_o1_bucket.json \
   request --output-len 64 --warmup 0 --iters 1
 ```
 
@@ -447,8 +447,8 @@ Performance gate:
 Canonical bs64 service result:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o1-bucket-07d6a40.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o1-bucket-07d6a40.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o1-bucket-07d6a40.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o1-bucket-07d6a40.json
 ```
 
 Observed:
@@ -473,8 +473,8 @@ collectives.
 Profile:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.json
 ```
 
 Observed:
@@ -490,25 +490,25 @@ Observed:
 Microbench:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
 cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph true \
   --format json \
-  --out /tmp/kimi_pplx_tp8_00b3f1f_micro_bs64_o128_warm1.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_00b3f1f_micro_bs64_o128_warm1.json \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 ```
 
 Result:
 
 - Output path:
-  `/tmp/kimi_pplx_tp8_00b3f1f_micro_bs64_o128_warm1.json`.
+  `$RESULT_ROOT/kimi_pplx_tp8_00b3f1f_micro_bs64_o128_warm1.json`.
 - All `64` traces have length `128`.
 - Hash counter: `32x 82a791616c737442`, `16x 4ae8834e96c7d195`,
   `16x 24b2b3856ac0ea3a`.
@@ -539,8 +539,8 @@ see the rejected item below.
 Profile:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.json
 ```
 
 Observed:
@@ -566,30 +566,30 @@ trace.
 Microbench:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
 cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph false \
   --format json \
-  --out /tmp/kimi_pplx_tp8_c1fast_mb1_o5.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_c1fast_mb1_o5.json \
   request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
 Result:
 
 - TP8 NCCL fast path:
-  `/tmp/kimi_nccl_tp8_c1fast_mb1_o5.json`, TTFT p50/p99
+  `$RESULT_ROOT/kimi_nccl_tp8_c1fast_mb1_o5.json`, TTFT p50/p99
   `4.71/6.32s`, e2e p50 `6.92s`, steady TPOT p50 `97.81ms`.
 - TP8 PPLX fast path:
-  `/tmp/kimi_pplx_tp8_c1fast_mb1_o5.json`, TTFT p50/p99
+  `$RESULT_ROOT/kimi_pplx_tp8_c1fast_mb1_o5.json`, TTFT p50/p99
   `5.27/7.35s`, e2e p50 `8.07s`, steady TPOT p50 `110.45ms`.
-- Both files match `/tmp/kimi_nccl_tp8_active64_o5_final.json` exactly:
+- Both files match `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json` exactly:
   0 per-index mismatches and hash counter `32x 7c4c5d83355198fd`,
   `32x 9eecc1ca6fb3409d`.
 
@@ -599,9 +599,9 @@ Correctness gate:
 uv run --no-project python - <<'PY'
 import collections, json, subprocess
 old=json.loads(subprocess.check_output(
-    ['ssh','h20-100','cat','/tmp/kimi_nccl_tp8_active64_o5_final.json']))
+    ['ssh','H20 node','cat','$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json']))
 new=json.loads(subprocess.check_output(
-    ['ssh','h20-100','cat','/tmp/kimi_pplx_tp8_c1fast_mb1_o5.json']))
+    ['ssh','H20 node','cat','$RESULT_ROOT/kimi_pplx_tp8_c1fast_mb1_o5.json']))
 mis=[i for i,(a,b) in enumerate(zip(
     old['metrics']['generated_token_traces'],
     new['metrics']['generated_token_traces'])) if a['prefix'] != b['prefix']]
@@ -618,8 +618,8 @@ Performance gate:
 Canonical bs64 service result:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.json
 ```
 
 Observed:
@@ -643,9 +643,9 @@ prefill trace-exact, or reduce the PPLX steady TPOT gap.
 Profile:
 
 ```text
-/tmp/kimi_pplx_tp8_o2_micro_bs64_o128_warm1.json
-/tmp/kimi_pplx_tp8_o3_scratch_micro_bs64_o128_warm1.json
-/tmp/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json
+$RESULT_ROOT/kimi_pplx_tp8_o2_micro_bs64_o128_warm1.json
+$RESULT_ROOT/kimi_pplx_tp8_o3_scratch_micro_bs64_o128_warm1.json
+$RESULT_ROOT/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json
 ```
 
 Observed:
@@ -658,7 +658,7 @@ Observed:
   routed F32 buffers per MoE layer and per request.
 - The first scratch-only probe improved the first wave but split bs64 admission
   into `40 + 24` requests:
-  `/tmp/kimi_pplx_tp8_o3_scratch_micro_bs64_o128_warm1.json` had
+  `$RESULT_ROOT/kimi_pplx_tp8_o3_scratch_micro_bs64_o128_warm1.json` had
   `max_e2e=25.594s`, about `320.1 tok/s`.
 - The split wave showed the fixed `20ms` coalesce window was too short for this
   pressure shape. After widening it to `100ms`, the same in-process probe
@@ -677,26 +677,26 @@ for avoiding a second full decode wave, which is worth seconds at bs64.
 Microbench:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
+$CARGO_BIN_DIR/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
   --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph true \
   --format json \
-  --out /tmp/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 ```
 
 Result:
 
 - Output path:
-  `/tmp/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json`.
+  `$RESULT_ROOT/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json`.
 - In-process wall throughput: `557.70 tok/s`
   (`64 * 128 / 14.688772613s`).
 - TTFT p50/p95/p99: `505.53/927.55/957.74ms`.
@@ -707,8 +707,8 @@ Result:
 Correctness gate:
 
 ```text
-/tmp/kimi_pplx_tp8_o3_scratch_coalesce_o5.json
-/tmp/kimi_nccl_tp8_active64_o5_final.json
+$RESULT_ROOT/kimi_pplx_tp8_o3_scratch_coalesce_o5.json
+$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json
 ```
 
 Observed:
@@ -722,8 +722,8 @@ Performance gate:
 Canonical bs64 service result:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json
 ```
 
 Observed:
@@ -748,8 +748,8 @@ NCCL/PPLX short-trace gate shows any mismatch.
 Profile:
 
 ```text
-/tmp/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json
+$RESULT_ROOT/kimi_pplx_tp8_o3_scratch_coalesce_micro_bs64_o128_warm1.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o3_scratch_coalesce_candidate.json
 ```
 
 Observed:
@@ -775,26 +775,26 @@ steady bs64 decode step, with no token-trace change.
 Microbench:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
+$CARGO_BIN_DIR/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
   --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph true \
   --format json \
-  --out /tmp/kimi_pplx_tp8_o5_router_overlap_micro_bs64_o128_warm1.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_o5_router_overlap_micro_bs64_o128_warm1.json \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 ```
 
 Result:
 
 - Output path:
-  `/tmp/kimi_pplx_tp8_o5_router_overlap_micro_bs64_o128_warm1.json`.
+  `$RESULT_ROOT/kimi_pplx_tp8_o5_router_overlap_micro_bs64_o128_warm1.json`.
 - In-process wall throughput: `582.9 tok/s`
   (`64 * 128 / 14.054035966s`).
 - TTFT p50/p95/p99: `504.81/925.43/955.54ms`.
@@ -806,8 +806,8 @@ Result:
 Correctness gate:
 
 ```text
-/tmp/kimi_pplx_tp8_o5_router_overlap_o5.json
-/tmp/kimi_nccl_tp8_active64_o5_final.json
+$RESULT_ROOT/kimi_pplx_tp8_o5_router_overlap_o5.json
+$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json
 ```
 
 Observed:
@@ -822,8 +822,8 @@ Performance gate:
 Canonical bs64 service result:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o5_router_overlap_candidate.json
 ```
 
 Observed:
@@ -848,10 +848,10 @@ NCCL/PPLX short-trace gate shows any mismatch.
 Profile:
 
 ```text
-/tmp/kimi-profile/f779a66/nsys_o5_bs64_o128/inproc_bs64_o128.sqlite
-/tmp/kimi-profile/f779a66/nsys_o5_bs64_o128/cuda_gpu_kern_sum.txt
-/tmp/kimi-profile/f779a66/nsys_o5_bs64_o128/tail.md
-/tmp/kimi-profile/f779a66/pplx_a2a_kimi_tok64.log
+$RESULT_ROOT/kimi-profile/f779a66/nsys_o5_bs64_o128/inproc_bs64_o128.sqlite
+$RESULT_ROOT/kimi-profile/f779a66/nsys_o5_bs64_o128/cuda_gpu_kern_sum.txt
+$RESULT_ROOT/kimi-profile/f779a66/nsys_o5_bs64_o128/tail.md
+$RESULT_ROOT/kimi-profile/f779a66/pplx_a2a_kimi_tok64.log
 ```
 
 Observed:
@@ -873,26 +873,26 @@ communication/local routed work can overlap with shared expert and all-reduce.
 Microbench:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
+$CARGO_BIN_DIR/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep \
   --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+  --model-path $MODEL_DIR \
   --cuda-graph true \
   --format json \
-  --out /tmp/kimi_pplx_tp8_o6_aux_routed_micro_bs64_o128_warm1.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_o6_aux_routed_micro_bs64_o128_warm1.json \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 ```
 
 Result:
 
 - Output path:
-  `/tmp/kimi_pplx_tp8_o6_aux_routed_micro_bs64_o128_warm1.json`.
+  `$RESULT_ROOT/kimi_pplx_tp8_o6_aux_routed_micro_bs64_o128_warm1.json`.
 - In-process wall throughput: `580.65 tok/s`
   (`64 * 128 / 14.108380907s`), below O5 `582.89 tok/s`.
 - TTFT p50/p95/p99: `505.43/927.11/957.29ms`, slightly worse than O5
@@ -905,8 +905,8 @@ Result:
 Correctness gate:
 
 ```text
-/tmp/kimi_pplx_tp8_o6_aux_routed_short.json
-/tmp/kimi_nccl_tp8_active64_o5_final.json
+$RESULT_ROOT/kimi_pplx_tp8_o6_aux_routed_short.json
+$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json
 ```
 
 Observed:
@@ -934,11 +934,11 @@ moving the whole routed path to a separate stream.
 Profile:
 
 ```text
-/tmp/kimi-profile/0ba76a6-counts-recv/pplx_a2a_normal_tok64.log
-/tmp/kimi-profile/0ba76a6-counts-recv/pplx_a2a_counts_only_tok64.log
-/tmp/kimi-profile/0ba76a6-counts-recv-v2/pplx_a2a_normal_tok64_canon.log
-/tmp/kimi-profile/0ba76a6-counts-recv-v2/pplx_a2a_counts_only_tok64_canon.log
-/tmp/kimi-profile/f779a66/nsys_o5_bs64_o128/cuda_gpu_kern_sum.txt
+$RESULT_ROOT/kimi-profile/0ba76a6-counts-recv/pplx_a2a_normal_tok64.log
+$RESULT_ROOT/kimi-profile/0ba76a6-counts-recv/pplx_a2a_counts_only_tok64.log
+$RESULT_ROOT/kimi-profile/0ba76a6-counts-recv-v2/pplx_a2a_normal_tok64_canon.log
+$RESULT_ROOT/kimi-profile/0ba76a6-counts-recv-v2/pplx_a2a_counts_only_tok64_canon.log
+$RESULT_ROOT/kimi-profile/f779a66/nsys_o5_bs64_o128/cuda_gpu_kern_sum.txt
 ```
 
 Observed:
@@ -972,12 +972,12 @@ TP8 NCCL/PPLX token-trace gate below.
 Normal:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 target/release/pplx_a2a_bench \
   --n-experts 384 --topk 8 --hidden-dim 7168 --world-size 8 \
   --max-num-tokens 64 --expert-padding 8 --warmup 20 --repeats 100 \
@@ -987,12 +987,12 @@ target/release/pplx_a2a_bench \
 Counts-only:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 target/release/pplx_a2a_bench \
   --n-experts 384 --topk 8 --hidden-dim 7168 --world-size 8 \
   --max-num-tokens 64 --expert-padding 8 --warmup 20 --repeats 100 \
@@ -1012,8 +1012,8 @@ Result:
 Correctness gate:
 
 ```text
-/tmp/kimi_pplx_tp8_counts_recv_short_v2.json
-/tmp/kimi_nccl_tp8_active64_o5_final.json
+$RESULT_ROOT/kimi_pplx_tp8_counts_recv_short_v2.json
+$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json
 ```
 
 Observed:
@@ -1028,7 +1028,7 @@ Performance gate:
 Supporting in-process probe:
 
 ```text
-/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
+$RESULT_ROOT/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
 ```
 
 Observed:
@@ -1043,8 +1043,8 @@ Observed:
 Canonical bs64 service result:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_counts_recv_v2.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_counts_recv_v2.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_counts_recv_v2.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_counts_recv_v2.json
 ```
 
 Observed:
@@ -1070,8 +1070,8 @@ NCCL/PPLX short-trace gate shows any mismatch.
 Profile:
 
 ```text
-/tmp/kimi_fusion_model_report_static_bs64_kv128_o7_baseline.json
-/tmp/kimi_fused_addrms_round_model_report_static_bs64_kv128.json
+$RESULT_ROOT/kimi_fusion_model_report_static_bs64_kv128_o7_baseline.json
+$RESULT_ROOT/kimi_fused_addrms_round_model_report_static_bs64_kv128.json
 ```
 
 Observed:
@@ -1102,16 +1102,16 @@ matching the separate `add_batch` then `rms_norm_batch` boundary.
 Microbench:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
-/root/.cargo/bin/cargo run --release -p pegainfer-kimi-k2 \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
+$CARGO_BIN_DIR/cargo run --release -p pegainfer-kimi-k2 \
   --features kernel-report,pplx-ep --bin kimi_model_report -- \
   decode --source static --batch-size 64 --kv-len 128 --iters 32 \
-  --format json --out /tmp/kimi_fused_addrms_round_model_report_static_bs64_kv128.json
+  --format json --out $RESULT_ROOT/kimi_fused_addrms_round_model_report_static_bs64_kv128.json
 ```
 
 Result:
@@ -1126,8 +1126,8 @@ Result:
 Correctness gate:
 
 ```text
-/tmp/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json
-/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
+$RESULT_ROOT/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json
+$RESULT_ROOT/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
 ```
 
 Observed:
@@ -1143,8 +1143,8 @@ Performance gate:
 Canonical bs64 service result:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fused_addrms_round.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fused_addrms_round.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fused_addrms_round.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fused_addrms_round.json
 ```
 
 Observed:
@@ -1168,9 +1168,9 @@ falls below O7's `511.78 tok/s`.
 Profile:
 
 ```text
-/tmp/kimi_pplx_tp8_prompt1_per_token_mb1_bs64_o5_probe.json
-/tmp/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o5_probe.json
-/tmp/kimi_pplx_tp8_prompt1_per_token_loop_mb64_bs64_o5_probe.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_per_token_mb1_bs64_o5_probe.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o5_probe.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_per_token_loop_mb64_bs64_o5_probe.json
 ```
 
 Observed:
@@ -1202,18 +1202,18 @@ shorter first-decode tail, without changing steady decode kernels.
 Microbench:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-/root/.cargo/bin/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
-  --model-path /data/models/Kimi-K2.5 \
+$CARGO_BIN_DIR/cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
+  --model-path $MODEL_DIR \
   --cuda-graph true \
   --format json \
-  --out /tmp/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o128_probe.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o128_probe.json \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 ```
 
@@ -1227,11 +1227,11 @@ Result:
 Correctness gate:
 
 ```text
-/tmp/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o5_probe.json
-/tmp/kimi_nccl_tp8_active64_o5_final.json
-/tmp/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o128_probe.json
-/tmp/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json
-/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o5_probe.json
+$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_per_token_loop_mb2_bs64_o128_probe.json
+$RESULT_ROOT/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json
+$RESULT_ROOT/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
 ```
 
 Observed:
@@ -1247,8 +1247,8 @@ Performance gate:
 Canonical bs64 service result:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_per_token_mb2_candidate.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_per_token_mb2_candidate.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_per_token_mb2_candidate.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_per_token_mb2_candidate.json
 ```
 
 Observed:
@@ -1274,12 +1274,12 @@ row-wise boundary is hiding a correctness issue.
 Profile:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_per_token_mb2_candidate.json
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb8_candidate.json
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_candidate.json
-/tmp/kimi_pplx_tp8_prompt1_warm_mb8_bs64_o128_probe.json
-/tmp/kimi_pplx_tp8_prompt1_warm_mb64_bs64_o5_probe.json
-/tmp/kimi_pplx_tp8_prompt1_warm_mb64_bs64_o128_probe.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_per_token_mb2_candidate.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb8_candidate.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_candidate.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_warm_mb8_bs64_o128_probe.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_warm_mb64_bs64_o5_probe.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_warm_mb64_bs64_o128_probe.json
 ```
 
 Observed:
@@ -1289,7 +1289,7 @@ Observed:
   waves were in the sub-second range. The remaining large tail was cold
   bs64/prompt_len1 first use, not the benchmark's frontend accounting.
 - Allocating only the decode arena before serving was not enough:
-  `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_mb2_warm_arena_candidate.json`
+  `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_mb2_warm_arena_candidate.json`
   reported output `522.16 tok/s`, TTFT p50/p95/p99
   `503/3342/3453ms`, TPOT p50/p95/p99 `115.06/118.10/118.80ms`.
 - Warming the prompt_len1 bs64 path before the service is marked ready
@@ -1325,18 +1325,18 @@ exact-token correctness baseline.
 Microbench:
 
 ```bash
-cd /root/develop/xingming/pegainfer
+cd $PEGAINFER_DIR
 CUDA_HOME=/usr/local/cuda \
 NVCC=/usr/local/cuda/bin/nvcc \
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.triton-venv/bin/python \
 PEGAINFER_KIMI_PARALLEL=tp8dp1 \
-/root/develop/xingming/pegainfer/target/release/bench_serving \
-  --model-path /data/models/Kimi-K2.5 \
+$PEGAINFER_DIR/target/release/bench_serving \
+  --model-path $MODEL_DIR \
   --cuda-graph true \
   --format json \
-  --out /tmp/kimi_pplx_tp8_prompt1_warm_mb64_bs64_o128_probe.json \
+  --out $RESULT_ROOT/kimi_pplx_tp8_prompt1_warm_mb64_bs64_o128_probe.json \
   request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 ```
 
@@ -1359,12 +1359,12 @@ Sweep result:
 Correctness / drift record:
 
 ```text
-/tmp/kimi_pplx_tp8_prompt1_warm_mb8_bs64_o128_probe.json
-/tmp/kimi_pplx_tp8_prompt1_warm_mb64_bs64_o5_probe.json
-/tmp/kimi_pplx_tp8_prompt1_warm_mb64_bs64_o128_probe.json
-/tmp/kimi_nccl_tp8_active64_o5_final.json
-/tmp/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json
-/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_warm_mb8_bs64_o128_probe.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_warm_mb64_bs64_o5_probe.json
+$RESULT_ROOT/kimi_pplx_tp8_prompt1_warm_mb64_bs64_o128_probe.json
+$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json
+$RESULT_ROOT/kimi_pplx_tp8_fused_addrms_round_bs64_o128.json
+$RESULT_ROOT/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
 ```
 
 Observed:
@@ -1387,8 +1387,8 @@ Performance gate:
 Canonical bs64 service result:
 
 ```text
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_candidate.log
-/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_candidate.json
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_candidate.log
+$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_prompt1_warm_forward_mb64_candidate.json
 ```
 
 Observed:
@@ -1415,12 +1415,12 @@ output falls under `523.88 tok/s`.
 ### Profile
 
 The O7 bs64 nsys attempt at
-`/tmp/kimi-profile/4131e17-compute-o7/nsys_bs64_o128/` exceeded its `15m`
+`$RESULT_ROOT/kimi-profile/4131e17-compute-o7/nsys_bs64_o128/` exceeded its `15m`
 timeout and was stopped without a usable `.nsys-rep`. The fallback static
 operator report is:
 
 ```text
-/tmp/kimi_fusion_model_report_static_bs64_kv128_o7_baseline.json
+$RESULT_ROOT/kimi_fusion_model_report_static_bs64_kv128_o7_baseline.json
 ```
 
 Baseline static bs64/kv128 local-compute report:
@@ -1445,7 +1445,7 @@ real: below `1ms` per bs64 decode step before collective and graph effects.
 Candidate static report:
 
 ```text
-/tmp/kimi_fusion_model_report_static_bs64_kv128_fused_addrms_candidate.json
+$RESULT_ROOT/kimi_fusion_model_report_static_bs64_kv128_fused_addrms_candidate.json
 ```
 
 Measured local-compute delta:
@@ -1463,8 +1463,8 @@ Measured local-compute delta:
 Short TP8 PPLX probe:
 
 ```text
-/tmp/kimi_pplx_tp8_fused_addrms_short.json
-/tmp/kimi_nccl_tp8_active64_o5_final.json
+$RESULT_ROOT/kimi_pplx_tp8_fused_addrms_short.json
+$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json
 ```
 
 Observed comparison output:
@@ -1492,7 +1492,7 @@ such as router and Marlin are addressed.
 Static bs64/kv128 model report identified the largest local-compute call sites:
 
 ```text
-/tmp/kimi_fusion_model_report_static_bs64_kv128_o7_baseline.json
+$RESULT_ROOT/kimi_fusion_model_report_static_bs64_kv128_o7_baseline.json
 ```
 
 Top call sites:
@@ -1504,8 +1504,8 @@ Top call sites:
 A short static nsys report split the router body:
 
 ```text
-/tmp/kimi-profile/26ec1e7-compute-static-report/static_bs64_kv128.nsys-rep
-/tmp/kimi-profile/26ec1e7-compute-static-report/cuda_gpu_kern_sum_cuda_gpu_kern_sum.txt
+$RESULT_ROOT/kimi-profile/26ec1e7-compute-static-report/static_bs64_kv128.nsys-rep
+$RESULT_ROOT/kimi-profile/26ec1e7-compute-static-report/cuda_gpu_kern_sum_cuda_gpu_kern_sum.txt
 ```
 
 Router internals from the nsys kernel summary:
@@ -1531,8 +1531,8 @@ remove most of the `45.84ms` local-compute router slice.
 Candidate static reports:
 
 ```text
-/tmp/kimi_router_fast16bf_model_report_static_bs64_kv128.json
-/tmp/kimi_router_compute32f_model_report_static_bs64_kv128.json
+$RESULT_ROOT/kimi_router_fast16bf_model_report_static_bs64_kv128.json
+$RESULT_ROOT/kimi_router_compute32f_model_report_static_bs64_kv128.json
 ```
 
 Measured results:
@@ -1548,7 +1548,7 @@ Measured results:
 Short output5 TP8 PPLX gate passed for `FAST_16BF`:
 
 ```text
-/tmp/kimi_pplx_tp8_router_fast16bf_short.json
+$RESULT_ROOT/kimi_pplx_tp8_router_fast16bf_short.json
 old Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})
 new Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})
 mismatches 0
@@ -1557,9 +1557,9 @@ mismatches 0
 The stronger output128 in-process gate failed against the O7 baseline:
 
 ```text
-/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
-/tmp/kimi_router_fast16bf_micro_bs64_o128_warm1.json
-/tmp/kimi_router_compute32f_micro_bs64_o128_warm1.json
+$RESULT_ROOT/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json
+$RESULT_ROOT/kimi_router_fast16bf_micro_bs64_o128_warm1.json
+$RESULT_ROOT/kimi_router_compute32f_micro_bs64_o128_warm1.json
 ```
 
 `FAST_16BF` output128:
@@ -1606,10 +1606,10 @@ model-level reference that explicitly accepts this numerical boundary change.
 | Date | Idea | Reason |
 | --- | --- | --- |
 | 2026-05-25 | Use TP1/DP8 correctness as the baseline for this doc | Deferred. TP1/DP8 matched short probes but diverged at 32 tokens, so DP1 TP8 work uses TP8 NCCL/PPLX baseline first. |
-| 2026-05-25 | Use the batch decode kernel as the `prompt_len=1` first-token path | Rejected. New TP8 NCCL and PPLX matched each other (`/tmp/kimi_nccl_tp8_single_prefill_batch_o2_o5.json` vs `/tmp/kimi_pplx_tp8_single_prefill_batch_o2_o5.json`: 0 mismatches), but both changed `32/64` per-index traces compared with the C1 TP8 NCCL ground truth `/tmp/kimi_nccl_tp8_active64_o5_final.json`. Hash counter changed from `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` to `48x 9eecc1ca6fb3409d`, `16x f45b2f0248e7059d`; this is not correctness-preserving. |
-| 2026-05-25 | Run the older exact prompt_len=1 fast prefill path with regular batched GEMM at microbatch `2` or larger | Rejected and superseded by O9's row-wise `per_token` variant. The full-batch probe `/tmp/kimi_nccl_tp8_c1batch_o5.json` produced `42/64` mismatches and hash counter `40x 7c4c5d83355198fd`, `18x f45b2f0248e7059d`, `6x 9eecc1ca6fb3409d`. A block-size-8 A/B still failed (`/tmp/kimi_nccl_tp8_c1batch_block8_o5.json`). The old scheduler microbatch=2 candidate `/tmp/kimi_nccl_tp8_c1micro2_o5.json` had `37/64` mismatches because it did not preserve the row-wise decode math boundary. |
-| 2026-05-25 | Use strided-batched per-token GEMM/router logits, or widen the O9 row-wise prompt_len=1 path directly to microbatch `64` as an exact-token optimization | Rejected as an exact-token optimization. Strided-batched per-token GEMM changed the short trace (`/tmp/kimi_pplx_tp8_prompt1_n1batched_bs64_o5_probe.json`: `64/64` mismatches; `/tmp/kimi_pplx_tp8_prompt1_per_token_mb2_bs64_o5_probe.json`: `32/64` mismatches). Row-wise GEMM fixed microbatch `2`, but row-wise microbatch `64` changed `/tmp/kimi_pplx_tp8_prompt1_per_token_loop_mb64_bs64_o5_probe.json` by `48/64` traces. O10 later keeps mb64 only under the explicit large-batch drift record. |
-| 2026-05-25 | Opportunistically coalesce multiple `EngineCoreOutputs` in `pegainfer-vllm-frontend` before msgpack/ZMQ send | Rejected after service pressure test. The protocol can carry many `EngineCoreOutput` values per message, and the candidate preserved request order/final outputs in unit tests, but the canonical bs64 service result regressed from O3 `492.34 tok/s` to `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o4_output_coalesce_candidate.json` output `487.70 tok/s`, TPOT p50/p95/p99 `122.29/126.70/127.57ms`. This indicates the remaining service gap is not dominated by one-msgpack-per-token-output framing. |
-| 2026-05-25 | Move the full routed expert/PPLX decode path to the aux stream after router | Rejected after correctness and microbench. The candidate preserved TP8 NCCL/PPLX short-token trace (`/tmp/kimi_pplx_tp8_o6_aux_routed_short.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches), but regressed the bs64/o128 in-process probe from O5 `582.89 tok/s`, TPOT p50/p95/p99 `102.84/104.09/105.48ms` to `/tmp/kimi_pplx_tp8_o6_aux_routed_micro_bs64_o128_warm1.json` `580.65 tok/s`, TPOT p50/p95/p99 `103.21/104.60/106.05ms`; service pressure was skipped because the lower-level gate already lost. |
-| 2026-05-25 | Fuse attention residual add with post-attention RMSNorm using the existing FlashInfer fused add+rmsnorm adapter | Rejected after microbench and correctness, not because the win was too small. Static bs64/kv128 operator reports changed the targeted local-compute slice from about `2932us` to `2735us`, only `~0.20ms` per rank, and `/tmp/kimi_pplx_tp8_fused_addrms_short.json` mismatched `/tmp/kimi_nccl_tp8_active64_o5_final.json` on `32/64` generated-token traces. The likely issue is different BF16 materialization/rounding than the current `add_batch` then `rms_norm_batch` sequence; O8 keeps an exact BF16-rounded variant instead. |
-| 2026-05-25 | Change router GEMM from `CUBLAS_COMPUTE_32F_PEDANTIC` to `FAST_16BF` or `COMPUTE_32F` | Rejected after a stronger output128 correctness gate. Static microbench improved router from `764us` to about `30us` per MoE layer and in-process TPOT p50 improved to `~44ms`, but both variants changed `32/64` output128 token traces versus `/tmp/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json`. The short output5 gate was too weak to catch this drift. |
+| 2026-05-25 | Use the batch decode kernel as the `prompt_len=1` first-token path | Rejected. New TP8 NCCL and PPLX matched each other (`$RESULT_ROOT/kimi_nccl_tp8_single_prefill_batch_o2_o5.json` vs `$RESULT_ROOT/kimi_pplx_tp8_single_prefill_batch_o2_o5.json`: 0 mismatches), but both changed `32/64` per-index traces compared with the C1 TP8 NCCL ground truth `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`. Hash counter changed from `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` to `48x 9eecc1ca6fb3409d`, `16x f45b2f0248e7059d`; this is not correctness-preserving. |
+| 2026-05-25 | Run the older exact prompt_len=1 fast prefill path with regular batched GEMM at microbatch `2` or larger | Rejected and superseded by O9's row-wise `per_token` variant. The full-batch probe `$RESULT_ROOT/kimi_nccl_tp8_c1batch_o5.json` produced `42/64` mismatches and hash counter `40x 7c4c5d83355198fd`, `18x f45b2f0248e7059d`, `6x 9eecc1ca6fb3409d`. A block-size-8 A/B still failed (`$RESULT_ROOT/kimi_nccl_tp8_c1batch_block8_o5.json`). The old scheduler microbatch=2 candidate `$RESULT_ROOT/kimi_nccl_tp8_c1micro2_o5.json` had `37/64` mismatches because it did not preserve the row-wise decode math boundary. |
+| 2026-05-25 | Use strided-batched per-token GEMM/router logits, or widen the O9 row-wise prompt_len=1 path directly to microbatch `64` as an exact-token optimization | Rejected as an exact-token optimization. Strided-batched per-token GEMM changed the short trace (`$RESULT_ROOT/kimi_pplx_tp8_prompt1_n1batched_bs64_o5_probe.json`: `64/64` mismatches; `$RESULT_ROOT/kimi_pplx_tp8_prompt1_per_token_mb2_bs64_o5_probe.json`: `32/64` mismatches). Row-wise GEMM fixed microbatch `2`, but row-wise microbatch `64` changed `$RESULT_ROOT/kimi_pplx_tp8_prompt1_per_token_loop_mb64_bs64_o5_probe.json` by `48/64` traces. O10 later keeps mb64 only under the explicit large-batch drift record. |
+| 2026-05-25 | Opportunistically coalesce multiple `EngineCoreOutputs` in `pegainfer-vllm-frontend` before msgpack/ZMQ send | Rejected after service pressure test. The protocol can carry many `EngineCoreOutput` values per message, and the candidate preserved request order/final outputs in unit tests, but the canonical bs64 service result regressed from O3 `492.34 tok/s` to `$RESULT_ROOT/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o4_output_coalesce_candidate.json` output `487.70 tok/s`, TPOT p50/p95/p99 `122.29/126.70/127.57ms`. This indicates the remaining service gap is not dominated by one-msgpack-per-token-output framing. |
+| 2026-05-25 | Move the full routed expert/PPLX decode path to the aux stream after router | Rejected after correctness and microbench. The candidate preserved TP8 NCCL/PPLX short-token trace (`$RESULT_ROOT/kimi_pplx_tp8_o6_aux_routed_short.json` vs `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches), but regressed the bs64/o128 in-process probe from O5 `582.89 tok/s`, TPOT p50/p95/p99 `102.84/104.09/105.48ms` to `$RESULT_ROOT/kimi_pplx_tp8_o6_aux_routed_micro_bs64_o128_warm1.json` `580.65 tok/s`, TPOT p50/p95/p99 `103.21/104.60/106.05ms`; service pressure was skipped because the lower-level gate already lost. |
+| 2026-05-25 | Fuse attention residual add with post-attention RMSNorm using the existing FlashInfer fused add+rmsnorm adapter | Rejected after microbench and correctness, not because the win was too small. Static bs64/kv128 operator reports changed the targeted local-compute slice from about `2932us` to `2735us`, only `~0.20ms` per rank, and `$RESULT_ROOT/kimi_pplx_tp8_fused_addrms_short.json` mismatched `$RESULT_ROOT/kimi_nccl_tp8_active64_o5_final.json` on `32/64` generated-token traces. The likely issue is different BF16 materialization/rounding than the current `add_batch` then `rms_norm_batch` sequence; O8 keeps an exact BF16-rounded variant instead. |
+| 2026-05-25 | Change router GEMM from `CUBLAS_COMPUTE_32F_PEDANTIC` to `FAST_16BF` or `COMPUTE_32F` | Rejected after a stronger output128 correctness gate. Static microbench improved router from `764us` to about `30us` per MoE layer and in-process TPOT p50 improved to `~44ms`, but both variants changed `32/64` output128 token traces versus `$RESULT_ROOT/kimi_pplx_tp8_counts_recv_micro_bs64_o128_warm1_v2.json`. The short output5 gate was too weak to catch this drift. |

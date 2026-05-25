@@ -59,14 +59,14 @@
 - CUDA Graph gate：按 Qwen 路径把 Kimi decode GPU body 拆成 graph 内 launch 和 graph 外 top1 D2H，server 侧临时把 Kimi `enable_cuda_graph` 打开，H20 `max_tokens=2` 四并发卡在第一轮 decode capture，日志只有 completions request，没有 completion/error；kill server 后客户端断连。结论：当前“整段 decode + NCCL all-reduce/reduce-scatter bridge”不能直接 CUDA Graph capture，表现为 capture-time hang。
 - graph root cause 复查：新增 `kimi_graph_probe`，H20 分别验证 local kernel、cuBLAS GEMM、NCCL all-reduce、NCCL reduce-scatter 的 capture/replay 均通过。此前 hang 不是 collective 不能进图，而是 Kimi worker 每个 rank 独立 begin/end/launch，NCCL graph capture 没有跨 rank 阶段对齐。
 - 修复：`CudaGraphState` 增加同步 phase hook；Kimi worker 在 graph capture/replay 的 begin、enqueue 后、end、launch 前后使用 rank barrier 对齐。`pegainfer-server` 侧 Kimi 开始尊重 `--cuda-graph true`，用于显式 gate。
-- H20 graph gate：`target/release/pegainfer --model-path /data/models/Kimi-K2.5 --port 18080 --cuda-graph true` 启动，4 并发 fixture prompt：
+- H20 graph gate：`target/release/pegainfer --model-path $MODEL_DIR --port 18080 --cuda-graph true` 启动，4 并发 fixture prompt：
   - `max_tokens=2`：wall `4511.0ms`，四路 token ids `[1008,2742]`，证明原 capture hang 已修；
   - warm `max_tokens=16`：wall `714.4ms`，`89.6 tok/s`，四路 16 token 全对；
   - warm `max_tokens=64`：wall `1523.1ms`，`168.1 tok/s`，`23.80ms/token/wave`，四路 prefix/tail 一致；
   - warm `max_tokens=128`：wall `2641.9ms`，`193.8 tok/s`，`20.64ms/token/wave`，四路 prefix/tail 一致。
 - 决策：Kimi graph 主线继续推进；当前 graph 能进整段 decode，但距离 `15ms/token/wave` 仍有约 `5.6ms` 差距。下一步不做 residual fusion，优先看 graph replay 下剩余 kernel/NCCL 时间组成，尤其是 TP hidden bridge、shared expert GEMM+collective、routed RS bridge 和 FlashInfer MLA。
-- bench graph 口径更新：`bench_serving request` 已补真实并发请求和 CUDA profiler API capture。H20 非 nsys 命令 `target/release/bench_serving --model-path /data/models/Kimi-K2.5 --cuda-graph true --format json --out /tmp/pegainfer-kimi-bench-profile-bs4/result_nonsys_graph_bs4_o64.json request --prompt-len 27 --output-len 64 --concurrency 4 --warmup 1 --iters 1` 得到 steady TPOT `16.70ms`、p50 `16.73ms`、p95 `17.04ms`、p99 `17.11ms`。该口径比 HTTP output128 的 `20.64ms/token/wave` 更接近纯 decode，但 prompt 使用 synthetic token ids，不是 vLLM fixture correctness gate。
-- nsys graph capture 更新：`/tmp/pegainfer-kimi-graph-profile-bs4/kimi_graph_bs4_o64.{nsys-rep,sqlite}` 由 `nsys profile -c cudaProfilerApi` 采集，measured window 只有 warmup 后的 4 并发 output64 iteration。CUDA API 表出现 `cuGraphLaunch count=504`，正好是 `8 ranks * 63 decode steps`，证明 graph replay 生效。nsys kernel 表里的 `magma_sgemmEx_kernel count=1920` 主要来自 measured request 的 prompt/prefill 和 graph 外展开，不能作为 steady decode graph 子节点总账；下一步要补 graph replay 外 CPU/API 开销和 rank sync 细分。
+- bench graph 口径更新：`bench_serving request` 已补真实并发请求和 CUDA profiler API capture。H20 非 nsys 命令 `target/release/bench_serving --model-path $MODEL_DIR --cuda-graph true --format json --out $RESULT_ROOT/pegainfer-kimi-bench-profile-bs4/result_nonsys_graph_bs4_o64.json request --prompt-len 27 --output-len 64 --concurrency 4 --warmup 1 --iters 1` 得到 steady TPOT `16.70ms`、p50 `16.73ms`、p95 `17.04ms`、p99 `17.11ms`。该口径比 HTTP output128 的 `20.64ms/token/wave` 更接近纯 decode，但 prompt 使用 synthetic token ids，不是 vLLM fixture correctness gate。
+- nsys graph capture 更新：`$RESULT_ROOT/pegainfer-kimi-graph-profile-bs4/kimi_graph_bs4_o64.{nsys-rep,sqlite}` 由 `nsys profile -c cudaProfilerApi` 采集，measured window 只有 warmup 后的 4 并发 output64 iteration。CUDA API 表出现 `cuGraphLaunch count=504`，正好是 `8 ranks * 63 decode steps`，证明 graph replay 生效。nsys kernel 表里的 `magma_sgemmEx_kernel count=1920` 主要来自 measured request 的 prompt/prefill 和 graph 外展开，不能作为 steady decode graph 子节点总账；下一步要补 graph replay 外 CPU/API 开销和 rank sync 细分。
 - 当前离 `15ms` 目标剩约 `1.7ms`。下一轮优先级：先解释 `cuGraphLaunch`/rank barrier 的每 step 固定开销和 worker report 聚合；然后看 TP hidden F32 bridge 与 shared/routed collective cadence。继续禁止 `bs==1` 专用分支。
 - overlap 决策：MoE shared branch 和 routed branch 都读 `scratch.normed`，直到最终 residual join 前理论上可并行；但生产路径当前是单 stream、单 NCCL comm、单 graph capture。直接改 worker 会同时触碰 scratch 生命周期、NCCL collective order 和 multi-stream graph capture。先新增隔离 `kimi_graph_probe --probe nccl-two-stream-overlap`：每 rank 两条 CUDA stream、两套 NCCL comm，通过 CUDA event 把 aux stream 纳入 main stream capture，验证 all-reduce 与 reduce-scatter 形态能否 capture/replay。只有 H20 probe 通过并且 nsys 证明存在真实 overlap，才进入 worker；失败则转向 shared gate/up fusion、routed combine 等 graph-safe 本地优化。
 - H20 overlap probe gate：同步 `kimi_graph_probe.rs` 后，远端 `cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_graph_probe`、`cargo build --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_graph_probe` 通过。命令 `timeout 120s target/release/kimi_graph_probe --probe nccl-two-stream-overlap --world-size 8 --batch-size 4 --hidden 7168 --replay-iters 200` 返回 `capture_ok=true`、`replay_ok=true`；同一 graph 形态下 max-rank sequential `43.99us`、overlap `27.00us`，speedup `1.63x`。结论：双 stream + 双 NCCL comm + event join 这类 graph 形态在 H20 上可行且有可测 replay 窗口；下一步进入 worker，把 MoE shared TP all-reduce 留在 main stream，把 routed router/Marlin/RS 放到 aux stream，最终 residual 前用 event join。
@@ -94,7 +94,7 @@
   - H20 build gate：远端 `cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins`、`cargo build --release -p pegainfer-server --bin bench_serving` 通过。
   - 真实 Kimi fixture prompt，output16/concurrency4：steady TPOT avg `14.145ms`、p50 `14.157ms`、p95 `14.308ms`、p99 `14.309ms`，四路 token prefix 完全匹配 vLLM fixture。
   - synthetic prompt-len27，output64/concurrency4/warmup1：steady TPOT avg `14.470ms`、p50 `14.529ms`、p95 `14.852ms`、p99 `14.917ms`、max `14.930ms`，四路 hash 一致。
-  - bench exit caveat：两组 `bench_serving` 都已写出 JSON 和指标，但进程退出时有 worker 残留占卡；验证后按具体 `bench_serving --model-path /data/models/Kimi-K2.5` 命令清理，H20 `nvidia-smi --query-compute-apps` 为空。后续要单独修 benchmark teardown，不把它记作 TPOT 回退。
+  - bench exit caveat：两组 `bench_serving` 都已写出 JSON 和指标，但进程退出时有 worker 残留占卡；验证后按具体 `bench_serving --model-path $MODEL_DIR` 命令清理，H20 `nvidia-smi --query-compute-apps` 为空。后续要单独修 benchmark teardown，不把它记作 TPOT 回退。
 - dense layer0 gate/up fused GEMM gate：dense layer0 的 `gate_proj` 和 `up_proj` 在 load-time `vstack` 为 `gate_up_proj`，prompt/decode 复用 `silu_mul_fused_batch_into`。这不是 bs1 分支，scratch 按实际 `1..=4` batch arena 分配。
   - 本地 gate：`cargo fmt --all --check`、`PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins` 通过。
   - H20 build gate：远端 `cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins`、`cargo build --release -p pegainfer-server --bin bench_serving` 通过。
@@ -119,7 +119,7 @@
 
 - H20 可用 `/usr/local/cuda/bin/nsys`；本轮同时保留两类数据：
   - 强同步分段 profile：临时硬编码 `ctx.sync()`，只用于定位 logical stage，不作为生产吞吐。
-  - nsys sqlite trace：产物在 `/tmp/pegainfer-kimi-nsys/kimi_bs4_decode.{nsys-rep,sqlite}`，tail 汇总在 `/tmp/pegainfer-kimi-nsys/tail-summary.md`。该请求在 nsys 下由于 profiler overhead 只有 `14.26 tok/s`，不能作为吞吐数值；输出 token 仍为 4 路一致的 16-token fixture。
+  - nsys sqlite trace：产物在 `$RESULT_ROOT/pegainfer-kimi-nsys/kimi_bs4_decode.{nsys-rep,sqlite}`，tail 汇总在 `$RESULT_ROOT/pegainfer-kimi-nsys/tail-summary.md`。该请求在 nsys 下由于 profiler overhead 只有 `14.26 tok/s`，不能作为吞吐数值；输出 token 仍为 4 路一致的 16-token fixture。
 - 4 并发 vLLM fixture prompt 的非 profile server 路径：
   - `max_tokens=8` 四路一致，wall `557.2ms`，32 output tokens，HTTP 端到端输出吞吐 `57.4 tok/s`。
   - 这个口径包含 4 路 prompt prefill、frontend、scheduler wave 和 response 开销，不是纯 decode。
@@ -184,22 +184,22 @@ cargo fmt --all --check
 PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins
 PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-qwen3-4b --features kernel-report --bins
 PEGAINFER_CUDA_SM=90a cargo test --release -p pegainfer-core --features kernel-call-trace collect_result_captures_calls_from_child_thread
-PEGAINFER_CUDA_SM=90a cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- trace --batch-size 4 --kv-len 1024 --out /tmp/kimi_decode_trace_bs4_kv1024.json
+PEGAINFER_CUDA_SM=90a cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- trace --batch-size 4 --kv-len 1024 --out $RESULT_ROOT/kimi_decode_trace_bs4_kv1024.json
 ```
 
 - trace 摘要：`calls=1765`、`unique_ops=18`，top ops 为 `gemm_graphsafe=489`、`rms_norm_batch=184`、`all_reduce=183`、`add_batch=122`、`kimi_marlin_wna16_gemm=120`。
 - H20 验证：
-  - 先 probe `h20-100`：仓库路径 `/root/develop/xingming/pegainfer-kimi-k2-main`，模型权重仍在 `/data/models/Kimi-K2.5`；本轮只做 build/trace，没有启动 server。
+  - 先 probe `H20 node`：仓库路径 `$PEGAINFER_DIR`，模型权重仍在 `$MODEL_DIR`；本轮只做 build/trace，没有启动 server。
   - dry-run rsync 后同步本轮精确文件列表；不传模型、日志或 build artifact。
-  - 远端首次 `cargo check` 失败于缺少 Triton Python：`Could not find a Python interpreter with Triton installed`。改用现有 `/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python` 作为 `PEGAINFER_TRITON_PYTHON` 后通过。
+  - 远端首次 `cargo check` 失败于缺少 Triton Python：`Could not find a Python interpreter with Triton installed`。改用现有 `$PEGAINFER_DIR/.venv-kimi/bin/python` 作为 `PEGAINFER_TRITON_PYTHON` 后通过。
   - 远端通过：
 
 ```bash
-PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python \
+PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python \
   cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins
-PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python \
+PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python \
   cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- \
-  trace --batch-size 4 --kv-len 1024 --out /tmp/kimi_decode_trace_bs4_kv1024.json
+  trace --batch-size 4 --kv-len 1024 --out $RESULT_ROOT/kimi_decode_trace_bs4_kv1024.json
 ```
 
   - 远端 trace 摘要同本地：`calls=1765`、`unique_ops=18`、JSON `1921890` bytes。运行结束后没有 Kimi server 进程；当时 H20 上另有无关 `scripts/pd_rdma_e2e.py --cuda-device 2` 占用约 `1520MiB`。
@@ -209,26 +209,26 @@ PEGAINFER_CUDA_SM=90a PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-k
   - 真实 runtime trace 最小 H20 命令：
 
 ```bash
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python \
 cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- \
-  trace --source runtime --batch-size 1 --kv-len 2 --out /tmp/kimi_runtime_trace_bs1_kv2.json
+  trace --source runtime --batch-size 1 --kv-len 2 --out $RESULT_ROOT/kimi_runtime_trace_bs1_kv2.json
 ```
 
-  - 第一轮忘记 `LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib`，scheduler 初始化阶段找不到 NCCL；修正环境后 trace 写出 JSON，但退出时 segfault。根因是 Kimi `start_engine` 丢弃 scheduler `JoinHandle`，进程退出时没有等待 CUDA/NCCL worker teardown。
+  - 第一轮忘记 `LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib`，scheduler 初始化阶段找不到 NCCL；修正环境后 trace 写出 JSON，但退出时 segfault。根因是 Kimi `start_engine` 丢弃 scheduler `JoinHandle`，进程退出时没有等待 CUDA/NCCL worker teardown。
   - 修复：`start_engine` 改为 `EngineHandle::new_with_join_handle(submit_tx, scheduler_handle)`；H20 重跑 runtime trace 退出码 `0`。
-  - 成功产物：`/tmp/kimi_runtime_trace_bs1_kv2.json`，`calls=1765`，first `decode.embedding / embedding_batch_vocab_shard`，last `decode.top1 / top1_batch`，top call counts 同静态 DAG。此证据来自真实 direct runtime decode worker，不经过 HTTP。
+  - 成功产物：`$RESULT_ROOT/kimi_runtime_trace_bs1_kv2.json`，`calls=1765`，first `decode.embedding / embedding_batch_vocab_shard`，last `decode.top1 / top1_batch`，top call counts 同静态 DAG。此证据来自真实 direct runtime decode worker，不经过 HTTP。
 - Runtime model report gate：
   - H20 最小命令：
 
 ```bash
-LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
+LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
-PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer-kimi-k2-main/.venv-kimi/bin/python \
+PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python \
 cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_model_report -- \
   decode --source runtime --batch-size 1 --kv-len 2 --iters 1 --format text \
-  --out /tmp/kimi_runtime_model_report_bs1_kv2.json
+  --out $RESULT_ROOT/kimi_runtime_model_report_bs1_kv2.json
 ```
 
   - 结果退出码 `0`，`schedule=1765`，`schedule_source="Kimi direct runtime decode trace via EngineHandle/worker; no HTTP"`，`coverage_missing=7`，`total_measured_us=17094.496`。这是账本结构 gate，不是性能结论；`iters=1` 只证明 model report 能消费真实 runtime call count。
@@ -241,8 +241,8 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
 - H20 runtime model report schema2 gate：`decode --source runtime --batch-size 1 --kv-len 2 --iters 1` 退出码 `0`。接入 Marlin provider 前输出 `total_schedule_calls=1765`、`measured_schedule_calls=1462`、`missing_schedule_calls=303`；接入 Marlin provider 后输出 `measured_schedule_calls=1582`、`missing_schedule_calls=183`，missing 只剩：
   - `all_reduce`: `183` calls / `5` normalized call-sites，reason 带 `rank participation hint=8`，说明它是 8 rank NCCL collective placeholder，不是单卡 kernel。
 - H20 report 产物：
-  - runtime bs1/kv2: `/tmp/kimi_runtime_model_report_bs1_kv2_marlin.json`，measured subset `51.796ms`，Marlin WNA16 `34.554ms`，coverage `1582/1765`。
-  - static bs4/kv1024: `/tmp/kimi_static_model_report_bs4_kv1024_marlin.json`，measured subset `149.904ms`，Marlin WNA16 `118.476ms`，coverage `1582/1765`。
+  - runtime bs1/kv2: `$RESULT_ROOT/kimi_runtime_model_report_bs1_kv2_marlin.json`，measured subset `51.796ms`，Marlin WNA16 `34.554ms`，coverage `1582/1765`。
+  - static bs4/kv1024: `$RESULT_ROOT/kimi_static_model_report_bs4_kv1024_marlin.json`，measured subset `149.904ms`，Marlin WNA16 `118.476ms`，coverage `1582/1765`。
 - 解读规则：`total_measured_us` 只代表 event provider 已覆盖的 rank0-local call subset，不是完整 TPOT；报告里的性能组成要同时读 `by_op` 和 `missing_by_op`。Marlin provider 当前用 synthetic all-local route，缺少真实 EP8 route histogram，所以 bs4 Marlin 占比不能直接当作线上 8 卡全局平均；它用于说明 report 已能把 W13/W2 大块计入账本，并暴露下一步需要 full-rank route histogram。
 
 ## NCCL barrier 排查：先收紧错误边界
@@ -286,7 +286,7 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
 - 本地编译门：
   - `cargo fmt --all --check`
   - `PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --tests`
-- H20 gate：h20-100 release build 通过。前两轮 4 并发 fixture `max_tokens=16` 全对，冷批 wall `4687.630ms`、`13.653 tok/s`，暖批 wall `803.357ms`、`79.666 tok/s`；随后两轮继续复现分叉，round2 row2 与 round3 row1/row2 变为 `[1008,2742,924,6454,2531,...]`。row-diff 仍出现 `mla_projected_allreduce`、`mla_residual_add`、`mla_residual`、dense 和 layer output 差异。因此 worker-thread NCCL init 只能保留为更合理的初始化方式，不能算 bug 修复。
+- H20 gate：H20 node release build 通过。前两轮 4 并发 fixture `max_tokens=16` 全对，冷批 wall `4687.630ms`、`13.653 tok/s`，暖批 wall `803.357ms`、`79.666 tok/s`；随后两轮继续复现分叉，round2 row2 与 round3 row1/row2 变为 `[1008,2742,924,6454,2531,...]`。row-diff 仍出现 `mla_projected_allreduce`、`mla_residual_add`、`mla_residual`、dense 和 layer output 差异。因此 worker-thread NCCL init 只能保留为更合理的初始化方式，不能算 bug 修复。
 - 诊断修正：旧 `debug_identical_decode_rows_*` 在 `clone_dtoh` 后没有二次 `ctx.sync()`，而 cudarc 的 `clone_dtoh` 只是 enqueue async D2H；同时 phase 全局 bitset 会遮住其他 rank/layer/step。新补丁改为 D2H 后同步，并用全局最多 `256` 条 report budget 替代 phase 去重。下一轮 H20 只用这套修正版 first-diff 判定 root cause。
 - 修正版 first-diff：4 并发 fixture 连续 4 轮中第 4 轮复现 row3 分叉。日志显示 `mla_projected_allreduce` 在 rank0..7 都出现同样 row0/row1 差异，且没有 `mla_projected` 本地差异报告；这不像 rank 私有状态或 stream race，更像 BF16 NCCL all-reduce 对不同 contiguous row offset 的归约顺序/舍入差异。诊断桥把 decode BF16 TP reductions 改为 F32 all-reduce：`bf16_hidden_to_f32_into -> all_reduce_f32_in_place -> f32_to_bf16_hidden_into`。
 - F32 bridge H20 gate：第 0 轮 output16 四路全对，但第 1 轮 row0/row2/row3 仍变为 `[1008,2742,924,6454,2531,...]`；`ROWDIFF_COUNT=0` 说明 layer0 row-state 已经不再分叉。全层 `layer_output` 诊断显示第一处变脏在 layer1，8 rank 都看到一致的 row1 diff，随后误差逐层放大。layer1 细 phase 显示 first dirty phase 是 `moe_routed_reduce`，即 routed expert F32 combine all-reduce 后出现 row diff。
@@ -299,7 +299,7 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
 - batched top1 改为 deterministic CUDA argmax 后，冷批 `max_tokens=8` 仍四路一致，但暖批和 output16 仍会发散，说明问题不在 FlashInfer top-k row-state。
 - `cudarc::nccl::safe::Comm` 使用的正是每个 rank worker 的同一条 CUDA stream；所以“同 stream 缺少 GPU sync”不是合理解释。当前定位转向 rank worker 到达 collective 的相位/尾部状态。
 - 临时诊断补丁：decode 路径每次 BF16/F32 NCCL all-reduce 前执行同一个 CPU `Barrier`，只对齐 8 个 rank 的 collective enqueue，不做 `device_ctx.sync()`，不 drain GPU stream。
-- H20 验证命令口径：`pegainfer-server` release binary，模型 `/data/models/Kimi-K2.5`，OpenAI `/v1/completions`，4 个并发请求，fixture 27-token prompt，`temperature=0`，`return_token_ids=true`。
+- H20 验证命令口径：`pegainfer-server` release binary，模型 `$MODEL_DIR`，OpenAI `/v1/completions`，4 个并发请求，fixture 27-token prompt，`temperature=0`，`return_token_ids=true`。
 - 历史结果：
   - `max_tokens=8` 冷批：wall `2093.9ms`，`15.3 tok/s`，四路一致 `[1008,2742,2531,414,19180,6082,1379,387]`。
   - `max_tokens=8` 暖批：wall `598.1ms`，`53.5 tok/s`，四路一致同上。
@@ -345,8 +345,8 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
 
 ## Execution Log: H20 server 端到端 gate
 
-- H20 路径：`/root/develop/xingming/pegainfer-kimi-k2-main`，模型 `/data/models/Kimi-K2.5`，端口 `18080`，NCCL symlink 使用 `/tmp/pegainfer-nccl-lib/libnccl.so`。
-- server 启动成功：`target/release/pegainfer --model-path /data/models/Kimi-K2.5 --port 18080`，engine load 日志 `elapsed_ms=131754`，OpenAI server 监听 `0.0.0.0:18080`。
+- H20 路径：`$PEGAINFER_DIR`，模型 `$MODEL_DIR`，端口 `18080`，NCCL symlink 使用 `$RESULT_ROOT/pegainfer-nccl-lib/libnccl.so`。
+- server 启动成功：`target/release/pegainfer --model-path $MODEL_DIR --port 18080`，engine load 日志 `elapsed_ms=131754`，OpenAI server 监听 `0.0.0.0:18080`。
 - `logprobs=5` 请求当前失败：HTTP 500，错误为 `completion response requested logprobs but generation returned none`。这说明 frontend 已把 logprobs 需求传到 response 层，但 Kimi scheduler 还没有随 token 返回 logprob/top-k payload。
 - raw text prompt gate：
   - 请求：`prompt="Hello"`、`max_tokens=1`、`temperature=0`、`return_token_ids=true`。
@@ -356,7 +356,7 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
   - 独立字段 `prompt_token_ids` 不被当前 frontend schema 接受，错误是缺少 `prompt` 字段。
   - OpenAI completion 的 token-id prompt 形式 `prompt=[19180]` 可用，并返回同样的 `token_ids=[950]`。
 - vLLM fixture prompt gate：
-  - 输入读取 `/data/fixtures/kimi-k2/k25_hello_vllm/prompt.json` 的 27 个 `input_ids`，用 `prompt=<ids>` 发送到 `/v1/completions`。
+  - 输入读取 `$FIXTURE_ROOT/kimi-k2/k25_hello_vllm/prompt.json` 的 27 个 `input_ids`，用 `prompt=<ids>` 发送到 `/v1/completions`。
   - `max_tokens=1` 返回 `token_ids=[1008]`、text `The`、`prompt_tokens=27`、`completion_tokens=1`，与既有 vLLM greedy token id `1008` 对齐。
   - `max_tokens=2` 仍只返回 `token_ids=[1008]`、`completion_tokens=1`。下一步主线阻断点明确为 scheduler token loop、prefill KV 保存和真实 decode step，而不是继续新增内部 smoke。
 - server 验证后已停止，H20 GPU 已释放。
@@ -392,7 +392,7 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
   - 本地 `PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --tests` 通过。
   - `rg` 确认 `pegainfer-kimi-k2/src/direct/{worker,scheduler}.rs` 里 `smoke/candidate/debug/dump/perf` 只剩 `debug_assert`。
   - H20 dry-run 后同步本轮 5 个文件：`pegainfer-kimi-k2/src/direct/{worker,scheduler}.rs`、`docs/index.md`、`docs/models/kimi-k2/{operator-todo,support-analysis}.md`。
-  - H20 `/root/develop/xingming/pegainfer-kimi-k2-main` 验证通过：`cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --tests`、`cargo build --release -p pegainfer-server`。
+  - H20 `$PEGAINFER_DIR` 验证通过：`cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --tests`、`cargo build --release -p pegainfer-server`。
 
 ## Execution Log: prompt prefill 写入 MLA paged KV
 
@@ -407,9 +407,9 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
   - `PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --tests` 通过。
 - H20 验证：
   - 同步代码后，`cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --tests`、`cargo build --release -p pegainfer-server` 通过。
-  - 启动 `target/release/pegainfer --model-path /data/models/Kimi-K2.5 --port 18080`，真实模型 load `131396ms`。
+  - 启动 `target/release/pegainfer --model-path $MODEL_DIR --port 18080`，真实模型 load `131396ms`。
   - vLLM fixture 27-token prompt 仍然对齐：`max_tokens=1` 返回 `token_ids=[1008]`、text `The`；`max_tokens=2` 返回 `token_ids=[1008,2742]`、text `The user`。
-  - 本次 HTTP payload 的 `model` 字段必须用 server 暴露的 `"/data/models/Kimi-K2.5"`；误写成 `"kimi-k2.5"` 会被 frontend 以 404 拒绝。
+  - 本次 HTTP payload 的 `model` 字段必须用 server 暴露的 `"$MODEL_DIR"`；误写成 `"kimi-k2.5"` 会被 frontend 以 404 拒绝。
   - 验证后 server 已停止，`nvidia-smi --query-compute-apps` 无 GPU compute 进程。
 
 ## Execution Log: scheduler wave bs4 decode 和 scratch 预分配
@@ -431,8 +431,8 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
   - `PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --tests` 通过。
 - H20 验证：
   - 同步前 rsync dry-run 覆盖 `pegainfer-kimi-k2/src/direct/worker.rs`，后续文档同步单独 dry-run；
-  - `/root/develop/xingming/pegainfer-kimi-k2-main` 下 `cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --tests`、`cargo build --release -p pegainfer-server --bin pegainfer --bin bench_serving` 通过。
-  - 启动 `target/release/pegainfer --model-path /data/models/Kimi-K2.5 --port 18080`，engine load `131661ms`。
+  - `$PEGAINFER_DIR` 下 `cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --tests`、`cargo build --release -p pegainfer-server --bin pegainfer --bin bench_serving` 通过。
+  - 启动 `target/release/pegainfer --model-path $MODEL_DIR --port 18080`，engine load `131661ms`。
   - 4 并发 vLLM fixture 27-token prompt：
     - `max_tokens=2`：四路均返回 `token_ids=[1008,2742]`、text `The user`，wall `1979.3ms`；
     - `max_tokens=8`：四路均返回 `token_ids=[1008,2742,2531,414,19180,6082,1379,387]`、text `The user said "Hello". This is`，wall `563.5ms`，32 output tokens，HTTP 端到端输出吞吐 `56.8 tok/s`。
@@ -499,16 +499,16 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
 
 ## Execution Log: Marlin WNA16 compute wrapper
 
-- 复核 H20 reference venv：`/root/develop/xingming/vllm_test/.venv` 是 vLLM `0.19.0`，`torch.ops._moe_C.moe_wna16_marlin_gemm` schema 没有 `is_ep`，但有 `a_scales`、`global_scale`、`thread_k/thread_n/blocks_per_sm`。不要再用较新的 `/root/develop/yingshan/vllm` Marlin header 作为当前 fixture ABI。
-- vendored csrc 改成 vLLM 0.19.0 ABI：`pegainfer-kernels/csrc/kimi_k2/vllm_marlin/moe/marlin_moe_wna16/{kernel.h,marlin_template.h}` 来自 `/data/code/vllm-int`；`quantization/marlin/{marlin.cuh,marlin_dtypes.cuh,dequant.h,marlin_mma.h}` 保留 standalone 编译，移除 PyTorch/ATen include。
+- 复核 H20 reference venv：`$VLLM_DIR/.venv` 是 vLLM `0.19.0`，`torch.ops._moe_C.moe_wna16_marlin_gemm` schema 没有 `is_ep`，但有 `a_scales`、`global_scale`、`thread_k/thread_n/blocks_per_sm`。不要再用较新的 `$VLLM_DIR_ALT` Marlin header 作为当前 fixture ABI。
+- vendored csrc 改成 vLLM 0.19.0 ABI：`pegainfer-kernels/csrc/kimi_k2/vllm_marlin/moe/marlin_moe_wna16/{kernel.h,marlin_template.h}` 来自 `$LOCAL_VLLM_DIR`；`quantization/marlin/{marlin.cuh,marlin_dtypes.cuh,dequant.h,marlin_mma.h}` 保留 standalone 编译，移除 PyTorch/ATen include。
 - 新增 Kimi wrapper：`kimi_marlin_wna16_gemm_cuda`、`kimi_marlin_w13_swiglu_cuda`、`kimi_marlin_sum_topk_rows_f32_cuda`；Rust 暴露 `kimi_marlin_wna16_w13_gemm`、`kimi_marlin_wna16_w2_gemm`、`kimi_marlin_w13_swiglu`、`kimi_marlin_sum_topk_rows_f32`。
-- vLLM fixture 生成器：`pegainfer-kernels/tools/kimi_k2/vllm_marlin_wna16_reference.py` 用 H20 vLLM op 生成 W13、W2 route output、final reduce 的 BF16 raw fixture。默认生成 synthetic fixture；传 `--model-path /data/models/Kimi-K2.5 --layer-idx 1 --rank 0` 时，直接从真实 checkpoint 读取 rank-local 48 个 experts 的 W13/W2 packed weight 与 scale，按 vLLM `gptq_marlin_moe_repack` / `marlin_moe_permute_scales` 生成 reference。
+- vLLM fixture 生成器：`pegainfer-kernels/tools/kimi_k2/vllm_marlin_wna16_reference.py` 用 H20 vLLM op 生成 W13、W2 route output、final reduce 的 BF16 raw fixture。默认生成 synthetic fixture；传 `--model-path $MODEL_DIR --layer-idx 1 --rank 0` 时，直接从真实 checkpoint 读取 rank-local 48 个 experts 的 W13/W2 packed weight 与 scale，按 vLLM `gptq_marlin_moe_repack` / `marlin_moe_permute_scales` 生成 reference。
 - `pegainfer-kimi-k2/src/weights.rs` 已按 Qwen3-4B flat module 风格拆成 `weights.rs` + `weights/{context,load,manifest,package,tests}.rs`，旧 CUTLASS raw/kernel package helper 和自写 dequant+cuBLAS self-comparison gate 已移除；当前 weights gate 只保留 Marlin package、真实 vLLM fixture parity、typed view 和 loader contract。
 - H20 验证：
   - `PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kernels --tests` 通过。
-  - `/root/develop/xingming/vllm_test/.venv/bin/python pegainfer-kernels/tools/kimi_k2/vllm_marlin_wna16_reference.py --out-dir /tmp/kimi_marlin_wna16_reference --tokens 4 --block-size 8` 通过。
+  - `$VLLM_DIR/.venv/bin/python pegainfer-kernels/tools/kimi_k2/vllm_marlin_wna16_reference.py --out-dir $RESULT_ROOT/kimi_marlin_wna16_reference --tokens 4 --block-size 8` 通过。
   - `cargo test --release -p pegainfer-kernels h20_kimi_marlin_wna16_single_layer_matches_vllm_reference -- --ignored --nocapture` 通过，`w13_out`、`route_output`、`final` 的 max/mean diff 均为 `0`。
-  - `/root/develop/xingming/vllm_test/.venv/bin/python pegainfer-kernels/tools/kimi_k2/vllm_marlin_wna16_reference.py --model-path /data/models/Kimi-K2.5 --layer-idx 1 --rank 0 --out-dir /data/fixtures/kimi-k2/k25_rank0_layer1_marlin_vllm --tokens 4 --block-size 8` 通过。
+  - `$VLLM_DIR/.venv/bin/python pegainfer-kernels/tools/kimi_k2/vllm_marlin_wna16_reference.py --model-path $MODEL_DIR --layer-idx 1 --rank 0 --out-dir $FIXTURE_ROOT/kimi-k2/k25_rank0_layer1_marlin_vllm --tokens 4 --block-size 8` 通过。
   - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_rank0_layer1_marlin_wna16_matches_vllm_reference -- --ignored --nocapture` 通过，真实 K2.5 rank0 layer1 的 `w13_out`、`route_output`、`final` 全部 `max_diff=0` / `mean_diff=0`。
 - 这一步证明真实 K2.5 单层 routed expert 的 Marlin WNA16 package + compute 链路与 vLLM fixture 对齐；full-forward parity 仍以多 prompt vLLM top-k gate 为准，decode(bs4) 仍需要 KV/cache 与 batch decode body。
 
@@ -524,7 +524,7 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
 - 新增 `as_marlin_weights()` view，后续 WNA16 compute ABI 可以直接消费 runtime-owned Marlin package，不再从 checkpoint raw package 临时转换。
 - 2026-05-21 H20 验证：
   - `h20_kimi_marlin_scale_reorder_matches_vllm_permute` 通过，确认 Marlin scale package 与 vLLM `marlin_moe_permute_scales` 的 group-major+perm64 语义一致。
-  - `h20_kimi_k25_rank0_marlin_expert_package_loads` 通过，真实 `/data/models/Kimi-K2.5` rank0 60 个 MoE layer 可打成 fused W13 + W2 Marlin-only package，`total_bytes < raw_source_bytes`，且 raw routed expert tensors 被移除。
+  - `h20_kimi_k25_rank0_marlin_expert_package_loads` 通过，真实 `$MODEL_DIR` rank0 60 个 MoE layer 可打成 fused W13 + W2 Marlin-only package，`total_bytes < raw_source_bytes`，且 raw routed expert tensors 被移除。
   - `h20_kimi_k25_rank0_sliced_payload_loads_typed_gpu_view` 通过，确认 fused W13 改动没有打断真实权重 loader / typed GPU view / CUTLASS probe 路线，且未回退到双 package 常驻 OOM。
 
 ## Execution Log: worker backend 切到 Marlin WNA16
@@ -540,21 +540,21 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
   - 第一轮 vocab-shard embedding all-reduce 前增加 rank barrier 和 stream drain。H20 上无 stream drain 时首个 collective 会报 `ncclUnhandledCudaError`；这是当前 NCCL-sum bridge 的约束，不是最终 PPLX/graph 形态。
 - H20 验证：
   - `PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --tests` 通过。
-  - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_all_rank_one_token_vocab_shard_top1_smoke -- --ignored --nocapture` 通过，真实 `/data/models/Kimi-K2.5`，8 rank，全 61 层，`attention_layers_stubbed=0`、`remaining_layers_stubbed=0`、`moe_layers_executed=60`。
-  - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_dump_all_rank_one_token_candidate_logits -- --ignored --nocapture` 通过，写出 `/data/fixtures/kimi-k2/pegainfer_k25_smoke_logits/candidate.safetensors`。
+  - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_all_rank_one_token_vocab_shard_top1_smoke -- --ignored --nocapture` 通过，真实 `$MODEL_DIR`，8 rank，全 61 层，`attention_layers_stubbed=0`、`remaining_layers_stubbed=0`、`moe_layers_executed=60`。
+  - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_dump_all_rank_one_token_candidate_logits -- --ignored --nocapture` 通过，写出 `$FIXTURE_ROOT/kimi-k2/pegainfer_k25_smoke_logits/candidate.safetensors`。
 - vLLM top-20 gate：
-  - fixture：`/data/fixtures/kimi-k2/k25_hello_vllm/reference.safetensors` 与 HTTP fixture `/data/fixtures/kimi-k2/k25_hello_vllm_http/response.json`。
+  - fixture：`$FIXTURE_ROOT/kimi-k2/k25_hello_vllm/reference.safetensors` 与 HTTP fixture `$FIXTURE_ROOT/kimi-k2/k25_hello_vllm_http/response.json`。
   - prompt len `27`，vLLM greedy token id `1008`。
   - PegaInfer candidate metadata：argmax id `1008`，argmax logit `24.875`，全 8 个 vocab shard considered。
   - top-20 id overlap `19/20`；PegaInfer top ids 前 8 为 `[1008, 19180, 4052, 18699, 3479, 2512, 16, 40]`，与 vLLM top ids 前 8 一致。
 - vLLM 多 prompt gate：
-  - fixture：`/data/fixtures/kimi-k2/k25_parity_vllm/{cases.json,hello,math_short,self_intro_zh,code_rust}`。
-  - PegaInfer candidate：`/data/fixtures/kimi-k2/pegainfer_k25_parity_candidates/{cases.json,hello,math_short,self_intro_zh,code_rust}`。
+  - fixture：`$FIXTURE_ROOT/kimi-k2/k25_parity_vllm/{cases.json,hello,math_short,self_intro_zh,code_rust}`。
+  - PegaInfer candidate：`$FIXTURE_ROOT/kimi-k2/pegainfer_k25_parity_candidates/{cases.json,hello,math_short,self_intro_zh,code_rust}`。
   - `compare_vllm_topk_fixture.py --top-k 20 --require-argmax --min-overlap 16` 通过。
   - 结果：`hello` argmax `1008` overlap `19/20`；`math_short` argmax `1008` overlap `20/20`；`self_intro_zh` argmax `4052` overlap `20/20`；`code_rust` argmax `1008` overlap `19/20`；vLLM top-k 上最大 logprob diff `0.749978`。
 - Prefill perf smoke：
   - 入口：`h20_kimi_k25_prompt_forward_perf_smoke`，同一次真实 K2.5 runtime load 后跑 `hello_27`、`synthetic_128`、`synthetic_512`、`synthetic_1024`。
-  - 输出：`/data/fixtures/kimi-k2/pegainfer_k25_perf_smoke/summary.json`。
+  - 输出：`$FIXTURE_ROOT/kimi-k2/pegainfer_k25_perf_smoke/summary.json`。
   - scope 明确为当前 correctness path：full prompt forward、NCCL-sum bridge、per-layer temporary allocation、host-visible final top1。
   - H20 结果：`hello_27` avg `103.17ms` / `261.70 tok/s`；`synthetic_128` avg `117.19ms` / `1092.20 tok/s`；`synthetic_512` avg `212.75ms` / `2406.63 tok/s`；`synthetic_1024` avg `358.26ms` / `2858.23 tok/s`。
   - 结论：prefill 目标在 128+ synthetic prompt 上已有初步余量，但这还不是 graph-ready/server perf gate；短 prompt 仍被固定开销主导。
@@ -577,13 +577,13 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
   - 当前 EP combine 是 NCCL-sum correctness bridge，不是 PPLX EP 生产路径；首个 TP collective 前仍有 barrier + stream drain。
 - H20 历史验证记录：
   - `PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --tests` 通过。
-  - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_rank0_one_token_forward_smoke -- --ignored --nocapture` 通过，真实权重路径 `/data/models/Kimi-K2.5`，用时约 `23.56s`。
+  - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_rank0_one_token_forward_smoke -- --ignored --nocapture` 通过，真实权重路径 `$MODEL_DIR`，用时约 `23.56s`。
   - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_rank0_sliced_payload_loads_typed_gpu_view -- --ignored --nocapture` 通过，旧 rank0 payload/router/expert gate 未回退，用时约 `23.10s`。
   - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_all_rank_one_token_vocab_shard_top1_smoke -- --ignored --nocapture` 通过，真实加载 8 rank K2.5 权重，8 个 rank 都执行 one-token smoke，并验证 `vocab_shards_considered=8`、`selected_from_global_vocab_shards=true`，Marlin worker backend 版本用时 `132.79s`。
   - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_dump_all_rank_one_token_candidate_logits -- --ignored --nocapture` 通过，真实生成 full-vocab smoke candidate safetensors，Marlin worker backend 版本用时 `132.47s`。
   - PegaInfer candidate argmax id `1008`，与 vLLM greedy id `1008` 一致；top-20 id overlap `19/20`。
   - `cargo test --release -p pegainfer-kimi-k2 h20_kimi_k25_dump_parity_prompt_candidates -- --ignored --nocapture` 通过，真实生成 4 个 prompt 的 full-vocab candidate safetensors，Marlin worker backend 版本用时 `133.43s`。
-  - `compare_vllm_topk_fixture.py --reference-root /data/fixtures/kimi-k2/k25_parity_vllm --candidate-root /data/fixtures/kimi-k2/pegainfer_k25_parity_candidates --top-k 20 --require-argmax --min-overlap 16` 通过，4/4 argmax match，top-20 overlap 最低 `19/20`。
+  - `compare_vllm_topk_fixture.py --reference-root $FIXTURE_ROOT/kimi-k2/k25_parity_vllm --candidate-root $FIXTURE_ROOT/kimi-k2/pegainfer_k25_parity_candidates --top-k 20 --require-argmax --min-overlap 16` 通过，4/4 argmax match，top-20 overlap 最低 `19/20`。
 - 这些 H20 ignored test 入口已从 direct worker/scheduler 删除；后续重新生成候选或性能数据走 server/bench 端到端路径，不再恢复内部 candidate dump 主线。
 
 ## Execution Log: worker-owned MLA decode cache
@@ -599,11 +599,11 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
   - attention 输出仍是 rank-local `o_proj` 前后结果，下一步要接 TP all-reduce / residual / MLP / logits。
 - 验证：
   - 本地：`PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --tests` 通过，只做编译门。
-  - H20 历史 layer0 decode smoke 通过，证明过真实 `/data/models/Kimi-K2.5` rank0 和 all-rank layer0 decode wiring；这些 ignored test 入口已从 direct crate 删除。
+  - H20 历史 layer0 decode smoke 通过，证明过真实 `$MODEL_DIR` rank0 和 all-rank layer0 decode wiring；这些 ignored test 入口已从 direct crate 删除。
   - H20 当前编译门：`cargo fmt --all --check`、`cargo check --release -p pegainfer-kimi-k2 --tests`、`cargo build --release -p pegainfer-server` 通过。
 - H20 NCCL 运行环境记录：
-  - `cudarc` 当前动态绑定会查找 `libnccl.so` 且要求 `ncclAlltoAll` 符号；`/root/develop/xingming/vllm_test/.venv/.../libnccl.so.2` 没有该符号。
-  - 本轮验证使用临时 symlink：`/tmp/pegainfer-nccl-lib/libnccl.so -> /root/develop/xingming/pegainfer/.venv/lib/python3.10/site-packages/nvidia/nccl/lib/libnccl.so.2`，该库是 `NCCL version 2.29.7+cuda12.9` 并包含 `ncclAlltoAll`。这是 H20 测试环境配置，不进入项目代码。
+  - `cudarc` 当前动态绑定会查找 `libnccl.so` 且要求 `ncclAlltoAll` 符号；`$VLLM_DIR/.venv/.../libnccl.so.2` 没有该符号。
+  - 本轮验证使用临时 symlink：`$RESULT_ROOT/pegainfer-nccl-lib/libnccl.so -> $PEGAINFER_DIR/.venv/lib/python3.10/site-packages/nvidia/nccl/lib/libnccl.so.2`，该库是 `NCCL version 2.29.7+cuda12.9` 并包含 `ncclAlltoAll`。这是 H20 测试环境配置，不进入项目代码。
 
 ## Preparation: CUTLASS INT4 grouped expert launcher
 
@@ -670,7 +670,7 @@ cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_mod
 ## Execution Log: WNA16 single-layer parity 容差 follow-up（2026-05-22）
 
 - 背景：cleanup commit `99b213a` 之后 h20 重跑 5 条 H20-only gate，4 条通过，唯一红的是 `h20_kimi_marlin_wna16_single_layer_matches_vllm_reference`。
-- 隔离实验：在 cleanup 前的 `cab7ba2` 上跑同测试，失败 bitwise 完全一致；再用 `pegainfer-kernels/tools/kimi_k2/vllm_marlin_wna16_reference.py` + vLLM 0.19.0 重生成 `/tmp/kimi_marlin_wna16_reference/`（`weight_source=deterministic_synthetic`），失败 bitwise 同样完全一致。结论：fixture 和 cleanup 都不是问题源，vLLM Marlin kernel 是 deterministic 的。
+- 隔离实验：在 cleanup 前的 `cab7ba2` 上跑同测试，失败 bitwise 完全一致；再用 `pegainfer-kernels/tools/kimi_k2/vllm_marlin_wna16_reference.py` + vLLM 0.19.0 重生成 `$RESULT_ROOT/kimi_marlin_wna16_reference/`（`weight_source=deterministic_synthetic`），失败 bitwise 同样完全一致。结论：fixture 和 cleanup 都不是问题源，vLLM Marlin kernel 是 deterministic 的。
 - 实际数字：`w13_out: max_diff=0.5 mean_diff=0.0055` 卡到 `(0.5, 0.03)` 上限通过；`route_output: max_diff=96 mean_diff=1.8632`，限 `(16, 0.03)`，max=96 / mean=1.86 在 BF16 量级 ~7000 下相对误差 < 0.03%（~1.5 ULP）。差异在 SwiGLU 之后的 w2 GEMM/atomic split-K 累加顺序上，不是算法 bug。
 - 决定：不动测试代码，保留这条作为"严格 bit-level parity"红线（`#[ignore]`，不进 default test run）。后续如果要让它转 green，要么换成 vLLM-side `use_atomic_add=False, use_fp32_reduce=True` 的稳定累加路径生成 fixture，要么把容差按 ULP-relative 重写，二选一前不动它。
-- 备份：旧 fixture 已挪到 h20-100 `/tmp/kimi_marlin_wna16_reference.bak.1779438284/`，新 fixture 在 `/tmp/kimi_marlin_wna16_reference/`。
+- 备份：旧 fixture 已挪到 H20 node `$RESULT_ROOT/kimi_marlin_wna16_reference.bak.1779438284/`，新 fixture 在 `$RESULT_ROOT/kimi_marlin_wna16_reference/`。

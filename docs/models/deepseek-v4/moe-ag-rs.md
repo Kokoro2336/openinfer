@@ -75,14 +75,14 @@ Decode MoE now uses GPU-resident allgather/router/local-expert/reduce-scatter fl
   - `rg -n "block_decode_group|group_rank_threads|attention_decode_group|decode_moe_ag_rs_group|all_gather_bf16_hidden_group|reduce_scatter_f32_hidden_group|all_gather_u32_group" pegainfer-deepseek-v4/src pegainfer-deepseek-v4/tests` returned no matches
 
 ### Step 7: Remote exact E2E after cleanup
-- Synced the cleanup files back to `5090:/root/develop/xingming/pegainfer`.
-- Verified model path on 5090: `/data/DeepSeek-V4-Flash`.
+- Synced the cleanup files back to `5090:$PEGAINFER_DIR`.
+- Verified model path on 5090: `$MODEL_DIR`.
 - Ran on 5090:
 
 ```bash
 source ~/.cargo/env 2>/dev/null || true
-cd /root/develop/xingming/pegainfer
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path /data/DeepSeek-V4-Flash
+cd $PEGAINFER_DIR
+PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path $MODEL_DIR
 ```
 
 - Result:
@@ -108,7 +108,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
   - `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` passed locally and on 5090
   - `cargo test --release -p pegainfer-deepseek-v4 --features deepseek-v4 --test mp8_manifest --no-run` passed locally
   - `rg -n "group_start|group_end|all_reduce_hidden_group|all_gather_logits_group|embedding_vocab_parallel_group|final_logits_group_bf16_hidden|hash_routed_moe_group_bf16_hidden|moe_group_bf16_hidden|attention_prefill_.*group|block_prefill_group|prefill_logits_group|prefill_logits_and_decode_cache_group|deepseek_mp8_check|contexts: Vec<RankGpuContext>" pegainfer-deepseek-v4/src pegainfer-deepseek-v4/tests pegainfer-deepseek-v4/Cargo.toml` returned no matches locally
-  - 5090 exact E2E with `/data/DeepSeek-V4-Flash` passed: `All 20 DeepSeek V4 exact cases passed`
+  - 5090 exact E2E with `$MODEL_DIR` passed: `All 20 DeepSeek V4 exact cases passed`
 
 ### Step 9: Split direct scheduler and worker files
 - Split the former monolithic `pegainfer-deepseek-v4/src/direct.rs` into:
@@ -146,7 +146,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
 - Exact E2E command run:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path /data/DeepSeek-V4-Flash
+PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path $MODEL_DIR
 ```
 
 - Result: `19 / 20` exact cases passed.
@@ -155,7 +155,7 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features de
 - Performance sanity command run:
 
 ```bash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path /data/DeepSeek-V4-Flash --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
+PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path $MODEL_DIR --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
 - Result:
@@ -181,8 +181,8 @@ PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_servin
 
 ```bash
 PEGAINFER_NVCC_JOBS=8 cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path /data/DeepSeek-V4-Flash
-PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path /data/DeepSeek-V4-Flash --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
+PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-deepseek-v4 --features deepseek-v4 --bin deepseek_v4_e2e -- --model-path $MODEL_DIR
+PEGAINFER_NVCC_JOBS=8 cargo run --release -p pegainfer-server --bin bench_serving --features deepseek-v4 -- --model-path $MODEL_DIR --format json request --prompt-len 1 --output-len 32 --warmup 1 --iters 1
 ```
 
 - Results:
