@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 use super::executor::ForwardExecutor;
 use super::worker::KimiOneTokenForwardReport;
 
+/// Stable per-rank decode arena capacity. Logical slot IDs are arena rows, so
+/// every TP1 DP8 decode/prefill command must keep this capacity stable.
 const MAX_BATCH_PER_DP: usize = 8;
 
 /// Coordinated DP engine: one coordinator thread drives all DP ranks in
@@ -39,12 +41,47 @@ struct PromptLen1Admission {
     req: GenerateRequest,
 }
 
+#[derive(Clone, Copy)]
+struct DecodeInput {
+    token_id: u32,
+    append_position: usize,
+    slot: usize,
+}
+
+enum PromptLen1DecodeRow {
+    Active(DecodeInput),
+    Admission(PromptLen1Admission),
+}
+
+impl PromptLen1DecodeRow {
+    fn token_id(&self) -> u32 {
+        match self {
+            Self::Active(input) => input.token_id,
+            Self::Admission(admission) => admission.req.prompt_tokens[0],
+        }
+    }
+
+    fn append_position(&self) -> usize {
+        match self {
+            Self::Active(input) => input.append_position,
+            Self::Admission(_) => 0,
+        }
+    }
+
+    fn slot(&self) -> usize {
+        match self {
+            Self::Active(input) => input.slot,
+            Self::Admission(admission) => admission.slot,
+        }
+    }
+}
+
 enum StepCommand {
     Decode {
         token_ids: Vec<u32>,
         positions: Vec<usize>,
         slots: Vec<usize>,
-        batch_size: usize,
+        decode_batch_size: usize,
     },
     Prefill {
         input_ids: Vec<u32>,
@@ -154,17 +191,27 @@ impl DpCoordinator {
         let mut reserved_free_slots = self.free_slot_lists();
 
         for req in pending_reqs.drain(..) {
-            if req.prompt_tokens.len() == 1 {
-                if req.max_tokens == 0 {
-                    send_scheduled(&req);
-                    let _ = req.token_tx.send(TokenEvent::Finished {
-                        finish_reason: FinishReason::Length,
-                        prompt_tokens: req.prompt_tokens.len(),
-                        completion_tokens: 0,
-                    });
-                    continue;
-                }
+            if req.max_tokens == 0 {
+                send_scheduled(&req);
+                let _ = req.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Length,
+                    prompt_tokens: req.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+                continue;
+            }
 
+            if req.prompt_tokens.is_empty() {
+                send_scheduled(&req);
+                let _ = req.token_tx.send(TokenEvent::Rejected {
+                    message: "Kimi-K2 forward requires at least one prompt token".into(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                });
+                continue;
+            }
+
+            if req.prompt_tokens.len() == 1 {
                 let Some(rank) = pick_rank_from_free_slots(&reserved_free_slots) else {
                     still_pending.push(req);
                     continue;
@@ -181,7 +228,15 @@ impl DpCoordinator {
             let dp_rank = lb.pick_rank(&self.ranks);
             match dp_rank {
                 Some(rank) => {
-                    self.admit_request(rank, req);
+                    let Some(slot) = self.ranks[rank].find_free_slot() else {
+                        still_pending.push(req);
+                        continue;
+                    };
+                    let Some(prefill_slots) = self.prefill_slots_for(rank, slot) else {
+                        still_pending.push(req);
+                        continue;
+                    };
+                    self.admit_request(rank, slot, prefill_slots, req);
                     reserved_free_slots = self.free_slot_lists();
                 }
                 None => still_pending.push(req),
@@ -200,6 +255,18 @@ impl DpCoordinator {
         self.ranks.iter().map(DpRankState::free_slots).collect()
     }
 
+    fn prefill_slots_for(&self, owning_rank: usize, owning_slot: usize) -> Option<Vec<usize>> {
+        let mut slots = Vec::with_capacity(self.dp_world);
+        for dp_rank in 0..self.dp_world {
+            if dp_rank == owning_rank {
+                slots.push(owning_slot);
+            } else {
+                slots.push(self.ranks[dp_rank].find_free_slot()?);
+            }
+        }
+        Some(slots)
+    }
+
     fn flush_prompt_len1_batch(&mut self, batch: &mut Vec<Vec<PromptLen1Admission>>) {
         if batch.iter().all(Vec::is_empty) {
             return;
@@ -208,45 +275,30 @@ impl DpCoordinator {
         self.synchronized_prompt_len1_decode(ready);
     }
 
-    fn admit_request(&mut self, dp_rank: usize, req: GenerateRequest) {
-        let slot = match self.ranks[dp_rank].find_free_slot() {
-            Some(s) => s,
-            None => {
-                let _ = req.token_tx.send(TokenEvent::Rejected {
-                    message: format!("DP rank {dp_rank} has no free slots"),
-                    prompt_tokens: req.prompt_tokens.len(),
-                    completion_tokens: 0,
-                });
-                return;
-            }
-        };
-
+    fn admit_request(
+        &mut self,
+        dp_rank: usize,
+        slot: usize,
+        prefill_slots: Vec<usize>,
+        req: GenerateRequest,
+    ) {
         send_scheduled(&req);
-
-        if req.max_tokens == 0 {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Length,
-                prompt_tokens: req.prompt_tokens.len(),
-                completion_tokens: 0,
-            });
-            return;
-        }
-        if req.prompt_tokens.is_empty() {
-            let _ = req.token_tx.send(TokenEvent::Rejected {
-                message: "Kimi-K2 forward requires at least one prompt token".into(),
-                prompt_tokens: 0,
-                completion_tokens: 0,
-            });
-            return;
-        }
 
         // Prefill: all ranks run prefill in lock-step so PPLX collectives
         // align. Owning rank processes real tokens; padding ranks process a
-        // single dummy token (output discarded).
-        self.synchronized_prefill(dp_rank, slot, &req);
+        // single dummy token into a free slot (output discarded).
+        self.synchronized_prefill(dp_rank, &prefill_slots, &req);
 
         let prompt_len = req.prompt_tokens.len();
-        let last_token = match &self.result_rxs[dp_rank].recv() {
+
+        let owner_result = self.result_rxs[dp_rank].recv();
+        for r in 0..self.dp_world {
+            if r != dp_rank {
+                let _ = self.result_rxs[r].recv();
+            }
+        }
+
+        let last_token = match &owner_result {
             Ok(StepResult::Prefill(Ok(report))) => {
                 let token_id = report.local_next_token_global_id;
                 if req
@@ -273,13 +325,6 @@ impl DpCoordinator {
             _ => return,
         };
 
-        // Drain padding results from other ranks
-        for r in 0..self.dp_world {
-            if r != dp_rank {
-                let _ = self.result_rxs[r].recv();
-            }
-        }
-
         let completion_tokens = 1;
         if completion_tokens >= req.max_tokens {
             let _ = req.token_tx.send(TokenEvent::Finished {
@@ -299,32 +344,45 @@ impl DpCoordinator {
         });
     }
 
-    fn synchronized_prompt_len1_decode(&mut self, mut batch: Vec<Vec<PromptLen1Admission>>) {
-        for (dp_rank, rank_batch) in batch.iter().enumerate() {
-            let cmd = if rank_batch.is_empty() {
+    fn synchronized_prompt_len1_decode(&mut self, batch: Vec<Vec<PromptLen1Admission>>) {
+        let mut rows_by_rank = Vec::with_capacity(self.dp_world);
+        for (dp_rank, rank_batch) in batch.into_iter().enumerate() {
+            let mut rows = self.ranks[dp_rank]
+                .active_decode_inputs()
+                .into_iter()
+                .map(PromptLen1DecodeRow::Active)
+                .collect::<Vec<_>>();
+            rows.extend(rank_batch.into_iter().map(PromptLen1DecodeRow::Admission));
+            if rows.len() > MAX_BATCH_PER_DP {
+                self.fail_prompt_len1_rows(
+                    dp_rank,
+                    rows,
+                    format!(
+                        "Kimi-K2 DP rank {dp_rank} prompt_len1 decode rows exceed arena capacity {MAX_BATCH_PER_DP}"
+                    ),
+                );
+                let _ = self.step_txs[dp_rank].send(build_padding_decode_command());
+                rows_by_rank.push(Vec::new());
+                continue;
+            }
+
+            let cmd = if rows.is_empty() {
                 build_padding_decode_command()
             } else {
-                StepCommand::Decode {
-                    token_ids: rank_batch
-                        .iter()
-                        .map(|admission| admission.req.prompt_tokens[0])
-                        .collect(),
-                    positions: vec![0; rank_batch.len()],
-                    slots: rank_batch.iter().map(|admission| admission.slot).collect(),
-                    batch_size: rank_batch.len(),
-                }
+                build_decode_command_from_rows(&rows)
             };
             let _ = self.step_txs[dp_rank].send(cmd);
+            rows_by_rank.push(rows);
         }
 
-        for (dp_rank, rank_batch) in batch.iter_mut().enumerate() {
+        for (dp_rank, rows) in rows_by_rank.into_iter().enumerate() {
             let result = match self.result_rxs[dp_rank].recv() {
                 Ok(StepResult::Decode(result)) => result,
                 Ok(StepResult::Prefill(_)) => continue,
                 Err(_) => continue,
             };
 
-            if rank_batch.is_empty() {
+            if rows.is_empty() {
                 continue;
             }
 
@@ -332,79 +390,117 @@ impl DpCoordinator {
                 Ok(reports) => reports,
                 Err(err) => {
                     eprintln!("kimi-k2: DP rank {dp_rank} prompt_len1 decode failed: {err:#}");
-                    for admission in rank_batch.drain(..) {
-                        let _ = admission.req.token_tx.send(TokenEvent::Error {
-                            message: format!(
-                                "Kimi-K2 DP rank {dp_rank} prompt_len1 decode failed: {err:#}"
-                            ),
-                            prompt_tokens: admission.req.prompt_tokens.len(),
-                            completion_tokens: 0,
-                        });
-                    }
+                    self.fail_prompt_len1_rows(
+                        dp_rank,
+                        rows,
+                        format!("Kimi-K2 DP rank {dp_rank} prompt_len1 decode failed: {err:#}"),
+                    );
                     continue;
                 }
             };
 
-            if reports.len() != rank_batch.len() {
+            if reports.len() != rows.len() {
                 let message = format!(
-                    "Kimi-K2 DP rank {dp_rank} prompt_len1 decode returned {} reports for {} requests",
+                    "Kimi-K2 DP rank {dp_rank} prompt_len1 decode returned {} reports for {} rows",
                     reports.len(),
-                    rank_batch.len()
+                    rows.len()
                 );
                 eprintln!("kimi-k2: {message}");
-                for admission in rank_batch.drain(..) {
-                    let _ = admission.req.token_tx.send(TokenEvent::Error {
-                        message: message.clone(),
-                        prompt_tokens: admission.req.prompt_tokens.len(),
-                        completion_tokens: 0,
-                    });
-                }
+                self.fail_prompt_len1_rows(dp_rank, rows, message);
                 continue;
             }
 
-            for (admission, report) in rank_batch.drain(..).zip(reports.into_iter()) {
-                let token_id = report.local_next_token_global_id;
-                if admission
-                    .req
-                    .token_tx
-                    .send(TokenEvent::Token {
-                        id: token_id,
-                        logprob: None,
-                    })
-                    .is_err()
-                {
-                    continue;
+            for (row, report) in rows.into_iter().zip(reports.into_iter()) {
+                match row {
+                    PromptLen1DecodeRow::Active(input) => {
+                        self.ranks[dp_rank].process_decode_report(input.slot, report);
+                    }
+                    PromptLen1DecodeRow::Admission(admission) => {
+                        self.install_prompt_len1_decode_result(dp_rank, admission, report);
+                    }
                 }
-
-                let completion_tokens = 1;
-                if completion_tokens >= admission.req.max_tokens {
-                    let _ = admission.req.token_tx.send(TokenEvent::Finished {
-                        finish_reason: FinishReason::Length,
-                        prompt_tokens: admission.req.prompt_tokens.len(),
-                        completion_tokens,
-                    });
-                    continue;
-                }
-
-                self.ranks[dp_rank].slots[admission.slot] = Some(RequestState {
-                    token_tx: admission.req.token_tx,
-                    prompt_len: admission.req.prompt_tokens.len(),
-                    completion_tokens,
-                    max_tokens: admission.req.max_tokens,
-                    last_token: token_id,
-                });
             }
         }
     }
 
-    fn synchronized_prefill(&self, owning_rank: usize, slot: usize, req: &GenerateRequest) {
+    fn install_prompt_len1_decode_result(
+        &mut self,
+        dp_rank: usize,
+        admission: PromptLen1Admission,
+        report: KimiOneTokenForwardReport,
+    ) {
+        let token_id = report.local_next_token_global_id;
+        if admission
+            .req
+            .token_tx
+            .send(TokenEvent::Token {
+                id: token_id,
+                logprob: None,
+            })
+            .is_err()
+        {
+            return;
+        }
+
+        let completion_tokens = 1;
+        if completion_tokens >= admission.req.max_tokens {
+            let _ = admission.req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: admission.req.prompt_tokens.len(),
+                completion_tokens,
+            });
+            return;
+        }
+
+        self.ranks[dp_rank].slots[admission.slot] = Some(RequestState {
+            token_tx: admission.req.token_tx,
+            prompt_len: admission.req.prompt_tokens.len(),
+            completion_tokens,
+            max_tokens: admission.req.max_tokens,
+            last_token: token_id,
+        });
+    }
+
+    fn fail_prompt_len1_rows(
+        &mut self,
+        dp_rank: usize,
+        rows: Vec<PromptLen1DecodeRow>,
+        message: String,
+    ) {
+        if rows
+            .iter()
+            .any(|row| matches!(row, PromptLen1DecodeRow::Active(_)))
+        {
+            let err = anyhow::anyhow!(message.clone());
+            self.ranks[dp_rank].fail_all_active(&err);
+        }
+
+        for row in rows {
+            let PromptLen1DecodeRow::Admission(admission) = row else {
+                continue;
+            };
+            let _ = admission.req.token_tx.send(TokenEvent::Error {
+                message: message.clone(),
+                prompt_tokens: admission.req.prompt_tokens.len(),
+                completion_tokens: 0,
+            });
+        }
+    }
+
+    fn synchronized_prefill(
+        &self,
+        owning_rank: usize,
+        prefill_slots: &[usize],
+        req: &GenerateRequest,
+    ) {
         let ep_max_seq_len = req.prompt_tokens.len();
+        debug_assert_eq!(prefill_slots.len(), self.dp_world);
         for dp_rank in 0..self.dp_world {
             let cmd = if dp_rank == owning_rank {
                 StepCommand::Prefill {
                     input_ids: req.prompt_tokens.clone(),
-                    slot,
-                    decode_batch_size: 1,
+                    slot: prefill_slots[dp_rank],
+                    decode_batch_size: MAX_BATCH_PER_DP,
                     ep_max_seq_len,
                 }
             } else {
@@ -412,8 +508,8 @@ impl DpCoordinator {
                 // pace, making exactly 1 PPLX dispatch/combine per MoE layer.
                 StepCommand::Prefill {
                     input_ids: vec![0],
-                    slot: 0,
-                    decode_batch_size: 1,
+                    slot: prefill_slots[dp_rank],
+                    decode_batch_size: MAX_BATCH_PER_DP,
                     ep_max_seq_len,
                 }
             };
@@ -471,31 +567,26 @@ impl DpRankState {
     }
 
     fn build_decode_command(&self) -> StepCommand {
-        let active: Vec<(usize, &RequestState)> = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|r| (i, r)))
-            .collect();
-
-        if active.is_empty() {
+        let inputs = self.active_decode_inputs();
+        if inputs.is_empty() {
             return build_padding_decode_command();
         }
 
-        let batch_size = active.len();
-        let token_ids: Vec<u32> = active.iter().map(|(_, r)| r.last_token).collect();
-        let positions: Vec<usize> = active
-            .iter()
-            .map(|(_, r)| r.prompt_len + r.completion_tokens - 1)
-            .collect();
-        let slots: Vec<usize> = active.iter().map(|(i, _)| *i).collect();
+        build_decode_command_from_inputs(&inputs)
+    }
 
-        StepCommand::Decode {
-            token_ids,
-            positions,
-            slots,
-            batch_size,
-        }
+    fn active_decode_inputs(&self) -> Vec<DecodeInput> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, state)| {
+                state.as_ref().map(|req| DecodeInput {
+                    token_id: req.last_token,
+                    append_position: req.prompt_len + req.completion_tokens - 1,
+                    slot,
+                })
+            })
+            .collect()
     }
 
     fn process_decode_results(&mut self, reports: Vec<KimiOneTokenForwardReport>) {
@@ -506,47 +597,54 @@ impl DpRankState {
             .filter_map(|(i, s)| s.as_ref().map(|_| i))
             .collect();
 
-        // Padding step — no active slots, no results to process
         if active_slots.is_empty() {
             return;
         }
 
-        let mut retire = Vec::new();
-        for (idx, report) in reports.into_iter().enumerate() {
-            if idx >= active_slots.len() {
-                break;
-            }
-            let slot_idx = active_slots[idx];
-            let req = self.slots[slot_idx].as_mut().unwrap();
-            let token_id = report.local_next_token_global_id;
-            req.completion_tokens += 1;
-
-            if req
-                .token_tx
-                .send(TokenEvent::Token {
-                    id: token_id,
-                    logprob: None,
-                })
-                .is_err()
-            {
-                retire.push(slot_idx);
-                continue;
-            }
-
-            if req.completion_tokens >= req.max_tokens {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Length,
-                    prompt_tokens: req.prompt_len,
-                    completion_tokens: req.completion_tokens,
-                });
-                retire.push(slot_idx);
-            } else {
-                req.last_token = token_id;
-            }
+        if reports.len() != active_slots.len() {
+            let err = anyhow::anyhow!(
+                "Kimi decode returned {} reports for {} active slots",
+                reports.len(),
+                active_slots.len()
+            );
+            self.fail_all_active(&err);
+            return;
         }
 
-        for slot_idx in retire {
+        for (slot_idx, report) in active_slots.into_iter().zip(reports.into_iter()) {
+            self.process_decode_report(slot_idx, report);
+        }
+    }
+
+    fn process_decode_report(&mut self, slot_idx: usize, report: KimiOneTokenForwardReport) {
+        let Some(req) = self.slots[slot_idx].as_mut() else {
+            return;
+        };
+
+        let token_id = report.local_next_token_global_id;
+        req.completion_tokens += 1;
+
+        if req
+            .token_tx
+            .send(TokenEvent::Token {
+                id: token_id,
+                logprob: None,
+            })
+            .is_err()
+        {
             self.slots[slot_idx] = None;
+            return;
+        }
+
+        if req.completion_tokens >= req.max_tokens {
+            let _ = req.token_tx.send(TokenEvent::Finished {
+                finish_reason: FinishReason::Length,
+                prompt_tokens: req.prompt_len,
+                completion_tokens: req.completion_tokens,
+            });
+            self.slots[slot_idx] = None;
+        } else {
+            req.last_token = token_id;
         }
     }
 
@@ -571,7 +669,28 @@ fn build_padding_decode_command() -> StepCommand {
         token_ids: vec![0],
         positions: vec![0],
         slots: vec![0],
-        batch_size: 1,
+        decode_batch_size: MAX_BATCH_PER_DP,
+    }
+}
+
+fn build_decode_command_from_rows(rows: &[PromptLen1DecodeRow]) -> StepCommand {
+    StepCommand::Decode {
+        token_ids: rows.iter().map(PromptLen1DecodeRow::token_id).collect(),
+        positions: rows
+            .iter()
+            .map(PromptLen1DecodeRow::append_position)
+            .collect(),
+        slots: rows.iter().map(PromptLen1DecodeRow::slot).collect(),
+        decode_batch_size: MAX_BATCH_PER_DP,
+    }
+}
+
+fn build_decode_command_from_inputs(inputs: &[DecodeInput]) -> StepCommand {
+    StepCommand::Decode {
+        token_ids: inputs.iter().map(|input| input.token_id).collect(),
+        positions: inputs.iter().map(|input| input.append_position).collect(),
+        slots: inputs.iter().map(|input| input.slot).collect(),
+        decode_batch_size: MAX_BATCH_PER_DP,
     }
 }
 
@@ -586,10 +705,14 @@ fn rank_forward_loop(
                 token_ids,
                 positions,
                 slots,
-                batch_size,
+                decode_batch_size,
             } => {
-                let result =
-                    executor.forward_decode_batch(&token_ids, &positions, &slots, batch_size);
+                let result = executor.forward_decode_batch(
+                    &token_ids,
+                    &positions,
+                    &slots,
+                    decode_batch_size,
+                );
                 let _ = res_tx.send(StepResult::Decode(result));
             }
             StepCommand::Prefill {
@@ -629,4 +752,144 @@ fn pick_rank_from_free_slots(free_slots: &[Vec<usize>]) -> Option<usize> {
         .filter(|(_, slots)| !slots.is_empty())
         .max_by_key(|(_, slots)| slots.len())
         .map(|(rank, _)| rank)
+}
+
+#[cfg(test)]
+mod tests {
+    use pegainfer_core::sampler::SamplingParams;
+
+    use super::*;
+
+    fn dummy_request(prompt_tokens: Vec<u32>, max_tokens: usize) -> GenerateRequest {
+        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
+            prompt_tokens,
+            params: SamplingParams::default(),
+            max_tokens,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        }
+    }
+
+    fn dummy_state(prompt_len: usize, completion_tokens: usize, last_token: u32) -> RequestState {
+        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        RequestState {
+            token_tx,
+            prompt_len,
+            completion_tokens,
+            max_tokens: 16,
+            last_token,
+        }
+    }
+
+    fn test_coordinator(dp_world: usize) -> DpCoordinator {
+        DpCoordinator {
+            dp_world,
+            ranks: (0..dp_world)
+                .map(|_| DpRankState {
+                    slots: (0..MAX_BATCH_PER_DP).map(|_| None).collect(),
+                })
+                .collect(),
+            executors: Vec::new(),
+            step_txs: Vec::new(),
+            result_rxs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sparse_decode_slot_keeps_stable_arena_capacity() {
+        let mut rank = DpRankState {
+            slots: (0..MAX_BATCH_PER_DP).map(|_| None).collect(),
+        };
+        rank.slots[MAX_BATCH_PER_DP - 1] = Some(dummy_state(4, 3, 123));
+
+        let StepCommand::Decode {
+            token_ids,
+            positions,
+            slots,
+            decode_batch_size,
+        } = rank.build_decode_command()
+        else {
+            panic!("decode command expected");
+        };
+
+        assert_eq!(decode_batch_size, MAX_BATCH_PER_DP);
+        assert_eq!(token_ids, vec![123]);
+        assert_eq!(positions, vec![6]);
+        assert_eq!(slots, vec![MAX_BATCH_PER_DP - 1]);
+    }
+
+    #[test]
+    fn prompt_len1_rows_merge_active_decode_and_new_admission() {
+        let rows = vec![
+            PromptLen1DecodeRow::Active(DecodeInput {
+                token_id: 11,
+                append_position: 5,
+                slot: 3,
+            }),
+            PromptLen1DecodeRow::Admission(PromptLen1Admission {
+                slot: 7,
+                req: dummy_request(vec![99], 8),
+            }),
+        ];
+
+        let StepCommand::Decode {
+            token_ids,
+            positions,
+            slots,
+            decode_batch_size,
+        } = build_decode_command_from_rows(&rows)
+        else {
+            panic!("decode command expected");
+        };
+
+        assert_eq!(decode_batch_size, MAX_BATCH_PER_DP);
+        assert_eq!(token_ids, vec![11, 99]);
+        assert_eq!(positions, vec![5, 0]);
+        assert_eq!(slots, vec![3, 7]);
+    }
+
+    #[test]
+    fn padding_decode_uses_stable_arena_capacity() {
+        let StepCommand::Decode {
+            token_ids,
+            positions,
+            slots,
+            decode_batch_size,
+        } = build_padding_decode_command()
+        else {
+            panic!("decode command expected");
+        };
+
+        assert_eq!(decode_batch_size, MAX_BATCH_PER_DP);
+        assert_eq!(token_ids, vec![0]);
+        assert_eq!(positions, vec![0]);
+        assert_eq!(slots, vec![0]);
+    }
+
+    #[test]
+    fn prefill_padding_slots_avoid_active_requests() {
+        let mut coordinator = test_coordinator(2);
+        coordinator.ranks[0].slots[0] = Some(dummy_state(4, 1, 10));
+
+        let slots = coordinator
+            .prefill_slots_for(1, 3)
+            .expect("rank 0 has a free padding slot");
+
+        assert_ne!(slots[0], 0);
+        assert_eq!(slots[1], 3);
+    }
+
+    #[test]
+    fn prefill_waits_when_any_padding_rank_is_full() {
+        let mut coordinator = test_coordinator(2);
+        for slot in 0..MAX_BATCH_PER_DP {
+            coordinator.ranks[0].slots[slot] = Some(dummy_state(4, 1, slot as u32));
+        }
+
+        assert!(coordinator.prefill_slots_for(1, 3).is_none());
+    }
 }

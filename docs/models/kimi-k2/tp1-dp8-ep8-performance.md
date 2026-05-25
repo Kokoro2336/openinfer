@@ -136,7 +136,7 @@ uv run --no-project python tools/nsys_tail_stats.py \
 
 ### O1 - prompt_len=1 admission goes through decode
 
-Status: keep, commit pending.
+Status: keep. Baseline implementation: `8946078`. Safety follow-up: pending commit.
 
 Profile:
 
@@ -156,8 +156,19 @@ Change:
 - `pegainfer-kimi-k2/src/runner/engine.rs`
   - `MAX_BATCH_PER_DP: 4 -> 8`.
   - Added prompt_len1 admission batching in `DpCoordinator`.
-  - For prompt_len1 requests, send `StepCommand::Decode { positions: vec![0], slots, batch_size }` instead of `Prefill`.
-  - Empty ranks still run padding decode to preserve PPLX collective order.
+  - For prompt_len1 requests, send `StepCommand::Decode { positions: vec![0], slots, decode_batch_size: MAX_BATCH_PER_DP }` instead of `Prefill`.
+  - Empty ranks still run padding decode with the same arena capacity to preserve PPLX collective order.
+  - Existing active rows are included in the same prompt_len1 admission decode command; padding rows can only use free slots.
+  - Ordinary prefill padding ranks write the dummy token into a free slot, not fixed slot 0. If any rank lacks a safe padding slot, that request remains pending.
+
+Correctness constraints:
+
+- In TP1 DP8, `decode_batch_size` means decode arena capacity, not active row count. Keep it fixed at `MAX_BATCH_PER_DP` for decode, prompt_len1 admission, padding decode, and ordinary prefill.
+- Slot IDs are decode arena row IDs. A request must keep the same arena bucket for prefill and all decode steps, otherwise its KV cache lives in a different arena.
+- PPLX decode scratch capacity must be identical across ranks even when active row counts differ.
+- Padding decode and padding prefill execute real kernels and can write KV. They may only target unoccupied slots.
+- Every synchronized step must drain one result from every DP rank, including the error path, before the next command is sent.
+- prompt_len1 admission at `append_position=0` must install request state after the first token, or finish/error the request in the same result pass.
 
 Microbench:
 
@@ -180,6 +191,17 @@ Correctness:
 - Smoke generated all 5 tokens for every request without PPLX collective mismatch or slot-state failure.
 - bs8/o8 deterministic smoke generated `8/8` full traces with one hash,
   `/tmp/kimi-tp1dp8/prompt1_decode_admission_bs8_o8_correctness.json`.
+- Local coordinator tests cover sparse logical slots, prompt_len1 admission mixed with active rows,
+  padding decode arena capacity, and ordinary prefill padding slot selection:
+
+```bash
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+cargo test -r -p pegainfer-kimi-k2 --features pplx-ep runner::engine::tests --no-fail-fast
+```
+
+Result: `5 passed`.
 - Old serial-prefill reference rerun from a detached `8431955` worktree was attempted, but the
   temporary worktree initially lacked the FlashInfer third-party include tree. After fixing that,
   the run was stopped because the current task shifted to rechecking vLLM; no serial-reference
