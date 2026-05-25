@@ -111,6 +111,18 @@ vllm bench serve \
   --result-filename pegainfer_tp1dp8_bs64_${COMMIT}.json
 ```
 
+GSM8K accuracy smoke, concurrent OpenAI `/v1/completions` path:
+
+```bash
+cd /root/develop/xingming/pegainfer
+source /tmp/kimi-lm-eval-venv/bin/activate
+lm_eval run --model local-completions \
+  --model_args "model=kimi-k2.5,base_url=http://127.0.0.1:8125/v1/completions,tokenizer_backend=huggingface,tokenizer=/data/models/Kimi-K2.5,tokenized_requests=False,trust_remote_code=True,max_length=4096,max_gen_toks=256,num_concurrent=16,timeout=300" \
+  --tasks gsm8k --num_fewshot 8 --batch_size 1 --limit 64 \
+  --output_path /tmp/kimi-tp1dp8-gsm8k-lm-eval-${COMMIT}-limit64-c16 \
+  --log_samples
+```
+
 vLLM TP1 DP8 EP8 baseline server:
 
 ```bash
@@ -250,6 +262,12 @@ Correctness:
 - Scope: this proves scheduler/collective/slot safety for the prompt_len1 decode-admission path.
   It is not a full TP1 DP8 token-parity gate against vLLM or TP8 DP1; that reference trace still
   needs explicit mismatch counts before this shape becomes an accuracy baseline.
+- GSM8K lm-eval smoke on h20-100 at `f193af2`, TP1 DP8 service,
+  `num_concurrent=16`, `limit=64`, `num_fewshot=8`, `max_gen_toks=256`:
+  strict-match and flexible-extract both `55/64 = 0.8594` (`stderr 0.0438`).
+  Artifacts:
+  `/tmp/kimi-tp1dp8-gsm8k-lm-eval-f193af2-limit64-c16/kimi-k2.5/results_2026-05-25T16-02-38.986675.json`
+  and `samples_gsm8k_2026-05-25T16-02-38.986675.jsonl`.
 - Local coordinator tests cover sparse logical slots, prompt_len1 admission mixed with active rows,
   padding decode arena capacity, and ordinary prefill padding slot selection:
 
