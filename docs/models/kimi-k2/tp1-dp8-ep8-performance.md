@@ -21,6 +21,12 @@ The older sweep in `docs/models/kimi-k2/vllm-h20-baseline.md` recorded bs64 TPOT
 `109.00/109.76ms`; the warmup-after rerun is slightly faster but still the same
 100ms-class H20 shape.
 
+The gate above is the sustained `num_prompts=256, max_concurrency=64` client shape,
+not a one-shot 64-request pure-decode wave. A separate command audit on 2026-05-25
+showed that vLLM can report `~50ms` TPOT for a single 64-request wave, then return to
+`~106ms` TPOT when the benchmark continuously refills another 192 requests. Treat these
+as different workloads.
+
 ## Method
 
 Performance work in this file follows this loop:
@@ -103,6 +109,53 @@ vllm bench serve \
   --save-detailed \
   --result-dir /tmp/kimi-tp1dp8-service \
   --result-filename pegainfer_tp1dp8_bs64_${COMMIT}.json
+```
+
+vLLM TP1 DP8 EP8 baseline server:
+
+```bash
+cd /root/develop/xingming/vllm_test
+source .venv/bin/activate
+vllm serve /data/models/Kimi-K2.5 \
+  --trust-remote-code \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 8 \
+  --enable-expert-parallel \
+  --api-server-count 1 \
+  --served-model-name kimi-k2.5 \
+  --port 8123 \
+  --max-num-seqs 64 \
+  --max-model-len 4096
+```
+
+Use the served model name on the client. vLLM 0.19.0 returns 404 for
+`--model /data/models/Kimi-K2.5` in the single-API-server setup.
+
+```bash
+cd /root/develop/xingming/vllm_test
+source .venv/bin/activate
+vllm bench serve \
+  --backend openai \
+  --model kimi-k2.5 \
+  --tokenizer /data/models/Kimi-K2.5 \
+  --trust-remote-code \
+  --base-url http://127.0.0.1:8123 \
+  --endpoint /v1/completions \
+  --dataset-name random \
+  --random-input-len 1 \
+  --random-output-len 128 \
+  --random-range-ratio 0 \
+  --num-prompts 256 \
+  --max-concurrency 64 \
+  --request-rate inf \
+  --ignore-eos \
+  --temperature 0 \
+  --percentile-metrics ttft,tpot,itl \
+  --metric-percentiles 50,95,99 \
+  --save-result \
+  --save-detailed \
+  --result-dir /tmp/kimi-vllm-dp8-cmdcheck-20260525 \
+  --result-filename api1_maxseq64_measure_bs64_o128_after_warmup_modelname.json
 ```
 
 nsys profile:
@@ -229,6 +282,41 @@ Performance:
   `256/256` success, output `594.57 tok/s`, TTFT p50/p99 `161.30/303.20ms`,
   TPOT p50/p95/p99 `107.20/109.00/109.20ms`, ITL p50/p99 `108.92/116.35ms`.
 
+vLLM startup-command audit, h20-100, vLLM `0.19.0`, NCCL path:
+
+- Original server command used `--max-model-len 4096`; the log confirms
+  `max_seq_len=4096`. `max_model_len` is therefore not the cause of the 100ms-class
+  sustained TPOT. The active context in this benchmark is only about 129 tokens.
+- vLLM workers initialize with `backend=nccl`, `vLLM is using nccl==2.27.5`, and
+  `Using AgRsAll2AllManager all2all manager`. Keep the vLLM baseline on this
+  NCCL/AgRs path.
+- `--all2all-backend pplx` is not a valid baseline knob for this environment. vLLM
+  logs `The 'pplx' all2all backend has been removed. Falling back to
+  'allgather_reducescatter'`.
+- `--enable-dbo` is also not valid while staying on the NCCL/AgRs
+  `allgather_reducescatter` path. vLLM rejects startup with:
+  `Microbatching currently only supports the deepep_low_latency and
+  deepep_high_throughput all2all backend`.
+- Default `api_server_count` becomes `data_parallel_size` (`8`). For one local
+  `vllm bench serve` client, use `--api-server-count 1` to remove HTTP/API-process
+  routing as a variable. This also reduces startup and graph-pool noise when paired
+  with `--max-num-seqs 64`.
+- `--max-num-seqs 64` changes graph capture from largest `512` to largest `128` and
+  graph pool from about `5.3 GiB` to `1.72 GiB`; it does not by itself fix sustained
+  `num_prompts=256` TPOT.
+- Single-wave bs64 after this command audit:
+  `/tmp/kimi-vllm-dp8-cmdcheck-20260525/api1_maxseq64_repeat64_after_256_modelname.json`
+  reports `64/64` success, output `1230.86 tok/s`, TPOT p50/p99
+  `50.45/50.46ms`.
+- Sustained bs64 with four refill waves:
+  `/tmp/kimi-vllm-dp8-cmdcheck-20260525/api1_maxseq64_measure_bs64_o128_after_warmup_modelname.json`
+  reports `256/256` success, output `600.55 tok/s`, TPOT p50/p99
+  `106.92/108.73ms`.
+- The sustained run starts requests in waves around seconds `0`, `12-13`, `26-27`,
+  and `40`. Those refill waves mix prompt_len=1 admission with ongoing decode. That
+  is the main interpretation difference between `50ms` one-shot pure decode and
+  `106ms` sustained service TPOT under the vLLM/NCCL baseline.
+
 Decision:
 
 - Keep. O1 moves prompt_len=1 onto the correct decode shape and clears the current H20
@@ -238,11 +326,13 @@ Decision:
 
 ## Open Questions
 
-- The H20 vLLM TP1 DP8 EP8 bs64 result remains 100ms-class even after explicit bs64 warmup and
-  CUDA graph capture (`PIECEWISE=51`, `FULL=35`) in
-  `/tmp/kimi-vllm-dp8-warmup-20260525/server.log`. This conflicts with the remembered 30ms-class
-  TPOT, which may have been measured on H200 or with a different all-to-all/backend shape.
-- Both vLLM and pegainfer detailed JSON report `max_concurrent_requests=128` while the client
-  command uses `--max-concurrency 64`; treat that field as a client-side reporting artifact until
-  checked in vLLM bench internals. Throughput and percentile metrics are still computed from the
-  completed request traces.
+- The H20 vLLM TP1 DP8 EP8 sustained bs64 result remains 100ms-class on NCCL/AgRs,
+  while one-shot bs64 is 50ms-class. The remembered 30ms-class TPOT may have been
+  measured on H200, on a one-shot pure-decode wave, or with a different vLLM
+  build/version/runtime flag set.
+- `vllm bench serve` can report `max_concurrent_requests=128` while the command uses
+  `--max-concurrency 64`. Source inspection shows the client semaphore is real, but
+  `max_concurrent_requests` is computed from one-second buckets and counts both
+  requests ending and requests starting inside the same bucket. Treat this field as a
+  coarse reporting artifact for refill-heavy runs; rely on the command shape, completed
+  traces, throughput, and TPOT/ITL percentiles.
