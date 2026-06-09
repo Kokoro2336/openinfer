@@ -163,6 +163,7 @@ pub enum TokenEvent {
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<EngineInner>,
+    servable_len: Option<u32>,
 }
 
 struct EngineInner {
@@ -210,7 +211,18 @@ impl EngineHandle {
                 command_tx,
                 join_handle,
             }),
+            servable_len: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_servable_len(mut self, servable_len: u32) -> Self {
+        self.servable_len = Some(servable_len);
+        self
+    }
+
+    pub fn servable_len(&self) -> Option<u32> {
+        self.servable_len
     }
 
     #[allow(clippy::result_large_err)]
