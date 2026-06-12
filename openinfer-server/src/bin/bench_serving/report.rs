@@ -97,6 +97,20 @@ pub(crate) struct SnapshotReport {
     pub(crate) parallel: Option<String>,
     pub(crate) prefill_heavy: SnapshotProfile,
     pub(crate) decode_heavy: SnapshotProfile,
+    /// Long cold prompt arriving into a decode-heavy steady state
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mixed_itl: Option<SnapshotMixedItl>,
+}
+
+/// Mixed-load ITL profile baked into a snapshot
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SnapshotMixedItl {
+    pub(crate) config: MixedLoadConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) baseline_itl: Option<DurationStats>,
+    pub(crate) itl: MixedLoadItl,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,10 +176,72 @@ pub(crate) struct CurveReport {
     pub(crate) windows: Vec<CurveWindow>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MixedLoadConfig {
+    pub(crate) bg_prompt_len: usize,
+    pub(crate) bg_concurrency: usize,
+    pub(crate) bg_output_len: usize,
+    pub(crate) inj_prompt_len: usize,
+    pub(crate) inj_output_len: usize,
+    pub(crate) qps: f64,
+    pub(crate) num_injections: usize,
+    pub(crate) inj_warm_frac: f64,
+    pub(crate) warmup: usize,
+    pub(crate) seed: u64,
+}
+
+/// Inter-token-latency of the background decode streams
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MixedLoadItl {
+    /// Every background decode gap.
+    pub(crate) all: DurationStats,
+    /// Gaps with no overlapping injection window (decode unaffected by prefill).
+    pub(crate) steady: Option<DurationStats>,
+    /// Gaps overlapping an in-flight prefill (the unified-step stall tail).
+    pub(crate) stall: Option<DurationStats>,
+    pub(crate) stall_gap_count: usize,
+    pub(crate) total_gap_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct InjectionRecord {
+    pub(crate) index: usize,
+    /// Whether this injection reused the shared prompt (intended prefix-cache hit).
+    pub(crate) warm: bool,
+    pub(crate) prefill_ms: f64,
+    pub(crate) arrival_offset_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MixedDecisionInputs {
+    pub(crate) baseline_p50_ms: Option<f64>,
+    pub(crate) baseline_p99_ms: Option<f64>,
+    pub(crate) mixed_p50_ms: f64,
+    pub(crate) mixed_p99_ms: f64,
+    pub(crate) p99_delta_ms: Option<f64>,
+    pub(crate) p99_delta_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MixedLoadReport {
+    pub(crate) commit: String,
+    pub(crate) date: String,
+    pub(crate) gpu: String,
+    pub(crate) run: RunInfo,
+    pub(crate) config: MixedLoadConfig,
+    pub(crate) baseline_itl: Option<DurationStats>,
+    pub(crate) mixed_itl: MixedLoadItl,
+    pub(crate) injections: Vec<InjectionRecord>,
+    pub(crate) decision_inputs: MixedDecisionInputs,
+    /// Non-fatal measurement caveats (e.g. a background stream finished early).
+    pub(crate) warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum BenchReport {
     Request(Box<RequestReport>),
     Matrix(MatrixReport),
     Curve(CurveReport),
+    Mixed(Box<MixedLoadReport>),
 }
