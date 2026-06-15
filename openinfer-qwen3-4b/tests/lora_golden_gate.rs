@@ -7,11 +7,16 @@
 //! Replay framework and tolerances are copied from `hf_golden_gate.rs` (tests cannot
 //! share modules); see that header for the rationale.
 //!
+//! On a host with >=2 GPUs it also replays under TP=2 against the same reference: the
+//! adapter is sharded per rank (B row-shard for q/k/v/gate/up, A col-shard for o/down),
+//! so the col-shard deltas are summed by the same all-reduce as the base output — a path
+//! single-GPU LoRA and the TP=2 base gate never exercise.
+//!
 //! Needs a CUDA GPU and Qwen3-4B weights (`OPENINFER_TEST_MODEL_PATH`); skips cleanly
 //! otherwise.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use openinfer_core::engine::{LoadLoraAdapterRequest, TokenLogprob};
@@ -103,24 +108,25 @@ fn check_position(
     reference: &[(u32, f32)],
 ) {
     stats.positions += 1;
-    let ref_top = reference[0].1;
-    let pega_argmax = pega[0].0;
-    let ref_map: HashMap<u32, f32> = reference.iter().copied().collect();
 
-    match ref_map.get(&pega_argmax) {
+    // Regret in our own distribution, not the reference's: a benign bf16 tie is not a wrong token.
+    let pega_top = pega[0].1;
+    let ref_argmax = reference[0].0;
+    match pega.iter().find(|&&(tok, _)| tok == ref_argmax) {
         None => stats.argmax_violations.push(format!(
-            "seq {seq} pos {pos}: openinfer's argmax {pega_argmax} is absent from the reference top-{}",
-            reference.len()
+            "seq {seq} pos {pos}: reference argmax {ref_argmax} is absent from openinfer's top-{}",
+            pega.len()
         )),
-        Some(&rlp) if ref_top - rlp > MARGIN_TOL => stats.argmax_violations.push(format!(
-            "seq {seq} pos {pos}: openinfer chose {pega_argmax}, which the reference scores {:.4} nat below its own argmax (> {MARGIN_TOL})",
-            ref_top - rlp
+        Some(&(_, plp)) if pega_top - plp > MARGIN_TOL => stats.argmax_violations.push(format!(
+            "seq {seq} pos {pos}: openinfer ranks {} over the reference argmax {ref_argmax} by {:.4} nat (> {MARGIN_TOL})",
+            pega[0].0,
+            pega_top - plp
         )),
         Some(_) => {}
     }
 
     for &(token, plp) in pega.iter().take(HEAD_K) {
-        if let Some(&rlp) = ref_map.get(&token) {
+        if let Some(&(_, rlp)) = reference.iter().find(|&&(t, _)| t == token) {
             let delta = (plp - rlp).abs();
             stats.head_deltas.push(delta);
             if stats.worst.is_none_or(|(w, ..)| delta > w) {
@@ -163,7 +169,7 @@ fn report_and_assert(label: &str, stats: &Stats) {
     }
     assert!(
         stats.argmax_violations.is_empty(),
-        "[{label}] openinfer picked a token the reference does not rank near its best:\n  {}",
+        "[{label}] openinfer's argmax disagrees with the reference beyond tolerance:\n  {}",
         stats.argmax_violations.join("\n  ")
     );
     assert!(
@@ -500,5 +506,15 @@ fn lora_logprobs_match_peft_golden_within_bf16_tolerance() {
 
     run_suite(&golden, &model_path, &adapter_dir, &[0], "");
 
+    if cuda_device_count() >= 2 {
+        run_suite(&golden, &model_path, &adapter_dir, &[0, 1], "tp2 ");
+    } else {
+        eprintln!("skipping lora_golden_gate TP=2 pass: <2 CUDA devices visible");
+    }
+
     let _ = std::fs::remove_dir_all(&adapter_dir);
+}
+
+fn cuda_device_count() -> usize {
+    cudarc::driver::CudaContext::device_count().map_or(0, |n| n.max(0) as usize)
 }
