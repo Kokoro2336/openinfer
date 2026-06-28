@@ -176,8 +176,7 @@ unsafe extern "C" {
 
     // Batch-invariant pinned-algo path (csrc/shared/linear.cu).
     pub fn gemm_lt_pin_tune_cuda(M: i32, rep_n: i32, K: i32) -> i32;
-
-    pub fn stream_is_capturing_cuda(stream: CUstream) -> i32;
+    pub fn gemm_lt_pin_check_cuda(M: i32, N: i32, K: i32) -> i32;
 
     pub fn gemm_lt_pin_cuda(
         W: *const Half,
@@ -188,8 +187,6 @@ unsafe extern "C" {
         K: i32,
         stream: CUstream,
     ) -> i32;
-
-    pub fn gemm_lt_pin_inspect_cuda(M: i32, K: i32, out4: *mut i32) -> i32;
 
     // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
     pub fn embedding_decode_cuda(

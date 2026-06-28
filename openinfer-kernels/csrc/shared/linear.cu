@@ -545,10 +545,12 @@ int gemm_lt_pin_tune_cuda(int M, int rep_n, int K) {
   return static_cast<int>(cudaSuccess);
 }
 
-// Run the pinned (M,K) algo at an arbitrary N (rebuilds only B/C). Returns PIN_UNTUNED (no plan)
-// or PIN_UNSUPPORTED (algo can't serve this N; caller falls back).
-int gemm_lt_pin_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y, int M, int N,
-                     int K, cudaStream_t stream) {
+// Run or check the pinned (M,K) algo at an arbitrary N (rebuilds only B/C). `check_only` skips the
+// matmul (W/X/Y/stream untouched) and returns 0 when the algo serves N. The serviceability tests
+// (AlgoCheck + workspace-over-budget) live here ONCE so the boot self-check is never more permissive
+// than production. Returns PIN_UNTUNED (no plan) or PIN_UNSUPPORTED (algo can't serve this N).
+static int lt_pin_run(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y, int M, int N,
+                      int K, cudaStream_t stream, bool check_only) {
   if (g_lt_handle == nullptr || g_lt_pin_workspace == nullptr) {
     return GEMM_LT_PIN_UNTUNED;
   }
@@ -574,6 +576,8 @@ int gemm_lt_pin_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat
       result = GEMM_LT_PIN_UNSUPPORTED;
     } else if (check.workspaceSize > LT_PIN_WORKSPACE_SIZE) {
       result = GEMM_LT_PIN_UNSUPPORTED;
+    } else if (check_only) {
+      result = 0;
     } else {
       const float h_alpha = 1.0f;
       const float h_beta = 0.0f;
@@ -589,29 +593,14 @@ int gemm_lt_pin_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat
   return result;
 }
 
-// Diagnostics: write [tile_id, stages_id, splitk_num, reduction_scheme] for (M,K) into out4;
-// GEMM_LT_PIN_UNTUNED if no pinned plan.
-int gemm_lt_pin_inspect_cuda(int M, int K, int *out4) {
-  if (out4 == nullptr) {
-    return static_cast<int>(cudaErrorInvalidValue);
-  }
-  auto it = g_lt_pin_plans.find(std::array<int, 2>{M, K});
-  if (it == g_lt_pin_plans.end()) {
-    return GEMM_LT_PIN_UNTUNED;
-  }
-  cublasLtMatmulAlgo_t &algo = it->second.algo;
-  int tile = -1, stages = -1, splitk = -1, reduction = -1;
-  size_t written = 0;
-  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof(tile),
-                                       &written);
-  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages,
-                                       sizeof(stages), &written);
-  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk,
-                                       sizeof(splitk), &written);
-  cublasLtMatmulAlgoConfigGetAttribute(&algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reduction,
-                                       sizeof(reduction), &written);
-  out4[0] = tile, out4[1] = stages, out4[2] = splitk, out4[3] = reduction;
-  return static_cast<int>(cudaSuccess);
+int gemm_lt_pin_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y, int M, int N,
+                     int K, cudaStream_t stream) {
+  return lt_pin_run(W, X, Y, M, N, K, stream, /*check_only=*/false);
+}
+
+// Boot self-check: thin check-only wrapper over lt_pin_run.
+int gemm_lt_pin_check_cuda(int M, int N, int K) {
+  return lt_pin_run(nullptr, nullptr, nullptr, M, N, K, /*stream=*/nullptr, /*check_only=*/true);
 }
 
 // Batched per-token GEMM: each row is computed as the same N=1 GEMM used by
@@ -646,16 +635,6 @@ int gemm_per_token_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
     }
   }
   return static_cast<int>(cudaPeekAtLastError());
-}
-
-// 1 if `stream` is mid graph-capture, 0 if not, <0 (negated cudaError_t) on query failure.
-int stream_is_capturing_cuda(cudaStream_t stream) {
-  cudaStreamCaptureStatus capture_status;
-  cudaError_t err = cudaStreamIsCapturing(stream, &capture_status);
-  if (err != cudaSuccess) {
-    return -static_cast<int>(err);
-  }
-  return capture_status == cudaStreamCaptureStatusNone ? 0 : 1;
 }
 
 } // extern "C"
