@@ -23,16 +23,17 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result, ensure};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DevicePtr};
 
+use openinfer_core::cuda_graph::CudaGraphState;
 use openinfer_core::weight_loader::{
     deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards,
     precompute_rope,
 };
 use openinfer_kernels::ops::{
-    add_batch_into, argmax_batch_bf16_split_partials_len, copy_hidden_token_range_into,
-    dflash_qk_norm_rope_into, embedding_batch, fused_add_rms_norm_round_batch_into,
-    gemm_into_checked, gemm_rows_into_checked, markov_step_argmax_into, rms_norm_batch_into,
+    add_batch_into, copy_hidden_token_range_into, dflash_qk_norm_rope_into, embedding_batch,
+    fused_add_rms_norm_round_batch_into, gemm_into_checked, gemm_rows_into_checked,
+    markov_step_argmax_into, markov_step_argmax_partials_len, rms_norm_batch_into,
     silu_mul_batch_into, single_prefill_nhd_noncausal_into,
 };
 use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
@@ -399,193 +400,321 @@ impl Glm52DsparkModel {
             ctx.stream
                 .memcpy_htod(&scratch.block_token_ids_h[..block_rows], &mut dst)?;
         }
-        embedding_batch(ctx, embed, &scratch.token_ids_d, &mut scratch.hidden)?;
 
-        // Per-request context projection: fc over the pending captured rows,
-        // then hidden_norm — persisted in the state so every layer's tail
-        // concat can read it.
+        // Host metadata that shapes the GEMMs below — hoisted ahead of the
+        // graphable region (during replay the closures do not run, and the
+        // shapes are baked at capture).
         for (i, state) in states.iter_mut().enumerate() {
             state.set_context_len(context_lens[i])?;
             state.pending.seq_len = context_lens[i];
-            gemm_into_checked(ctx, &self.fc, &state.pending, &mut state.context_projected)?;
-            rms_norm_batch_into(
-                ctx,
-                &state.context_projected,
-                &self.hidden_norm,
-                DSPARK_RMS_EPS,
-                &mut state.context_hidden,
-            );
-            state.pending_len = 0;
-            state.pending.seq_len = 0;
+        }
+        let max_tail = context_lens.iter().max().copied().unwrap_or(0) + block;
+        ensure!(
+            max_tail <= scratch.tail_input.data.len() / GLM52_HIDDEN,
+            "dspark tail length {max_tail} exceeds the preallocated cap"
+        );
+        // The tail seq_lens must be set OUTSIDE the graphable region: a replay
+        // does not run the captured closure, but the always-eager dynamic
+        // middle consumes these bounds every round — a stale value from a
+        // previous accept length either trips the copy range check (engine
+        // teardown) or ropes garbage rows. At bs=1 this single assignment is
+        // the round's truth; at bs>1 state_prep re-sets them per slot (eager).
+        let tail_len0 = context_lens[0] + block;
+        scratch.tail_input.seq_len = tail_len0;
+        scratch.k_tail.seq_len = tail_len0;
+        scratch.v_tail.seq_len = tail_len0;
+
+        // Piecewise forward graph (bs=1): only the `committed_len`-derived
+        // arguments vary per round (rope positions, KV-append offsets,
+        // attention kv_len — 4 launches/layer, kept EAGER since a captured
+        // FlashInfer prefill bakes its KV iteration count). The rest is
+        // shape-static per `context_len` → `DSPARK_LAYERS + 1` dense segments,
+        // replayed. rows > 1 falls back to eager (shared tail scratch, see
+        // state_prep). First round per key stays eager (cuBLAS lazy workspace
+        // would abort capture). The hidden/hidden_out swap is host-side and
+        // baked by capture; no eager op touches either buffer.
+        // DSPARK_NO_FORWARD_GRAPH=1 disables.
+        let slot_ident = {
+            let (ptr, _guard) = states[0].pending.data.device_ptr(&ctx.stream);
+            ptr
+        };
+        let fwd_key = (slot_ident, context_lens[0]);
+        let fwd_on = active == 1
+            && context_lens[0] <= GLM52_DSPARK_BLOCK
+            && std::env::var_os("DSPARK_NO_FORWARD_GRAPH").is_none();
+        let use_graph = fwd_on && scratch.forward_warm.contains(&fwd_key);
+        if use_graph {
+            scratch
+                .forward_graphs
+                .entry(fwd_key)
+                .or_insert_with(|| (0..=DSPARK_LAYERS).map(|_| CudaGraphState::new()).collect());
         }
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            rms_norm_batch_into(
-                ctx,
-                &scratch.hidden,
-                &layer.input_ln,
-                DSPARK_RMS_EPS,
-                &mut scratch.normed,
-            );
-            gemm_rows_into_checked(
-                ctx,
-                &layer.qkv,
-                0,
-                DSPARK_QKV_DIM,
-                &scratch.normed,
-                &mut scratch.q_batch,
-            )?;
+        {
+            let Glm52DsparkScratch {
+                forward_graphs,
+                hidden,
+                hidden_out,
+                normed,
+                q_batch,
+                attn_output,
+                o_buf,
+                gate_out,
+                up_out,
+                act_out,
+                logits_normed,
+                logits,
+                tail_input,
+                k_tail,
+                v_tail,
+                token_ids_d,
+                ..
+            } = &mut *scratch;
 
-            for (i, state) in states.iter_mut().enumerate() {
-                let context_len = context_lens[i];
-                let tail_len = context_len + block;
-                let row_offset = i * block;
-                scratch.set_tail_len(tail_len)?;
-
-                // tail_input = [context_hidden | normed block rows].
-                copy_hidden_token_range_into(
-                    ctx,
-                    &state.context_hidden,
-                    0,
-                    &mut scratch.tail_input,
-                    0,
-                    context_len,
-                )?;
-                copy_hidden_token_range_into(
-                    ctx,
-                    &scratch.normed,
-                    row_offset,
-                    &mut scratch.tail_input,
-                    context_len,
-                    block,
-                )?;
-
-                gemm_rows_into_checked(
-                    ctx,
-                    &layer.qkv,
-                    DSPARK_QKV_DIM,
-                    DSPARK_QKV_DIM,
-                    &scratch.tail_input,
-                    &mut scratch.k_tail,
-                )?;
-                gemm_rows_into_checked(
-                    ctx,
-                    &layer.qkv,
-                    2 * DSPARK_QKV_DIM,
-                    DSPARK_QKV_DIM,
-                    &scratch.tail_input,
-                    &mut scratch.v_tail,
-                )?;
-
-                // Q rows sit at the block positions (anchor_pos..+block); the
-                // K tail starts at the first uncached context position.
-                dflash_qk_norm_rope_into(
-                    ctx,
-                    &mut scratch.q_batch,
-                    row_offset,
-                    block,
-                    &mut scratch.k_tail,
-                    &layer.q_norm,
-                    &layer.k_norm,
-                    &self.cos_cache,
-                    &self.sin_cache,
-                    DSPARK_HEADS,
-                    DSPARK_HEADS,
-                    DSPARK_HEAD_DIM,
-                    state.committed_len + context_len,
-                    state.committed_len,
-                    DSPARK_RMS_EPS,
-                )?;
-
-                let cache = &mut state.layers[layer_idx];
-                copy_hidden_token_range_into(
-                    ctx,
-                    &scratch.k_tail,
-                    0,
-                    &mut cache.k,
-                    state.committed_len,
-                    tail_len,
-                )?;
-                copy_hidden_token_range_into(
-                    ctx,
-                    &scratch.v_tail,
-                    0,
-                    &mut cache.v,
-                    state.committed_len,
-                    tail_len,
-                )?;
-                // Bidirectional within the block (speculators non_causal);
-                // the cached context is everything before the anchor.
-                single_prefill_nhd_noncausal_into(
-                    ctx,
-                    &scratch.q_batch,
-                    row_offset,
-                    block,
-                    &cache.k,
-                    &cache.v,
-                    &mut scratch.attn_output,
-                    DSPARK_HEADS,
-                    DSPARK_HEADS,
-                    DSPARK_HEAD_DIM,
-                    state.committed_len + tail_len,
-                )?;
+            // The batch-wide dense prolog of layer `l`: input norm + q GEMM.
+            macro_rules! layer_prolog {
+                ($l:expr) => {{
+                    let layer = &self.layers[$l];
+                    rms_norm_batch_into(ctx, hidden, &layer.input_ln, DSPARK_RMS_EPS, normed);
+                    gemm_rows_into_checked(ctx, &layer.qkv, 0, DSPARK_QKV_DIM, normed, q_batch)?;
+                }};
+            }
+            // One slot's tail assembly + k/v GEMMs into the SHARED tail
+            // scratch. The tail must be consumed (state_dynamic!) before the
+            // next slot's prep overwrites it — at `active == 1` the graphed
+            // composition satisfies this trivially; at `active > 1` the layer
+            // interleaves prep/dynamic per slot exactly like the pre-graph
+            // code did.
+            macro_rules! state_prep {
+                ($l:expr, $i:expr, $state:expr) => {{
+                    let layer = &self.layers[$l];
+                    let state = $state;
+                    let i: usize = $i;
+                    {
+                        let context_len = context_lens[i];
+                        let tail_len = context_len + block;
+                        let row_offset = i * block;
+                        tail_input.seq_len = tail_len;
+                        k_tail.seq_len = tail_len;
+                        v_tail.seq_len = tail_len;
+                        copy_hidden_token_range_into(
+                            ctx,
+                            &state.context_hidden,
+                            0,
+                            tail_input,
+                            0,
+                            context_len,
+                        )?;
+                        copy_hidden_token_range_into(
+                            ctx,
+                            normed,
+                            row_offset,
+                            tail_input,
+                            context_len,
+                            block,
+                        )?;
+                        gemm_rows_into_checked(
+                            ctx,
+                            &layer.qkv,
+                            DSPARK_QKV_DIM,
+                            DSPARK_QKV_DIM,
+                            tail_input,
+                            k_tail,
+                        )?;
+                        gemm_rows_into_checked(
+                            ctx,
+                            &layer.qkv,
+                            2 * DSPARK_QKV_DIM,
+                            DSPARK_QKV_DIM,
+                            tail_input,
+                            v_tail,
+                        )?;
+                    }
+                }};
+            }
+            // The dense tail of layer `l`: o_proj + post-norm + MLP + residual.
+            macro_rules! layer_tail {
+                ($l:expr) => {{
+                    let layer = &self.layers[$l];
+                    gemm_into_checked(ctx, &layer.o_proj, attn_output, o_buf)?;
+                    fused_add_rms_norm_round_batch_into(
+                        ctx,
+                        hidden,
+                        o_buf,
+                        &layer.post_ln,
+                        DSPARK_RMS_EPS,
+                        normed,
+                    )?;
+                    gemm_rows_into_checked(ctx, &layer.gate_up, 0, DSPARK_INTER, normed, gate_out)?;
+                    gemm_rows_into_checked(
+                        ctx,
+                        &layer.gate_up,
+                        DSPARK_INTER,
+                        DSPARK_INTER,
+                        normed,
+                        up_out,
+                    )?;
+                    silu_mul_batch_into(ctx, gate_out, up_out, act_out)?;
+                    gemm_into_checked(ctx, &layer.down, act_out, o_buf)?;
+                    add_batch_into(ctx, hidden, o_buf, hidden_out)?;
+                    std::mem::swap(&mut *hidden, &mut *hidden_out);
+                }};
+            }
+            // One slot's round-varying middle — always eager.
+            macro_rules! state_dynamic {
+                ($l:expr, $i:expr, $state:expr) => {{
+                    let layer = &self.layers[$l];
+                    let state = $state;
+                    let i: usize = $i;
+                    {
+                        let context_len = context_lens[i];
+                        let tail_len = context_len + block;
+                        let row_offset = i * block;
+                        dflash_qk_norm_rope_into(
+                            ctx,
+                            q_batch,
+                            row_offset,
+                            block,
+                            k_tail,
+                            &layer.q_norm,
+                            &layer.k_norm,
+                            &self.cos_cache,
+                            &self.sin_cache,
+                            DSPARK_HEADS,
+                            DSPARK_HEADS,
+                            DSPARK_HEAD_DIM,
+                            state.committed_len + context_len,
+                            state.committed_len,
+                            DSPARK_RMS_EPS,
+                        )?;
+                        let cache = &mut state.layers[$l];
+                        copy_hidden_token_range_into(
+                            ctx,
+                            k_tail,
+                            0,
+                            &mut cache.k,
+                            state.committed_len,
+                            tail_len,
+                        )?;
+                        copy_hidden_token_range_into(
+                            ctx,
+                            v_tail,
+                            0,
+                            &mut cache.v,
+                            state.committed_len,
+                            tail_len,
+                        )?;
+                        single_prefill_nhd_noncausal_into(
+                            ctx,
+                            q_batch,
+                            row_offset,
+                            block,
+                            &cache.k,
+                            &cache.v,
+                            attn_output,
+                            DSPARK_HEADS,
+                            DSPARK_HEADS,
+                            DSPARK_HEAD_DIM,
+                            state.committed_len + tail_len,
+                        )?;
+                    }
+                }};
+            }
+            macro_rules! run_seg {
+                ($idx:expr, $body:block) => {{
+                    if use_graph {
+                        forward_graphs
+                            .get_mut(&fwd_key)
+                            .expect("forward graph entry created before the segments")[$idx]
+                            .run_or_capture(ctx, || -> Result<()> { $body Ok(()) })?;
+                    } else {
+                        (|| -> Result<()> { $body Ok(()) })()?;
+                    }
+                }};
             }
 
-            gemm_into_checked(ctx, &layer.o_proj, &scratch.attn_output, &mut scratch.o_buf)?;
-            fused_add_rms_norm_round_batch_into(
-                ctx,
-                &mut scratch.hidden,
-                &scratch.o_buf,
-                &layer.post_ln,
-                DSPARK_RMS_EPS,
-                &mut scratch.normed,
-            )?;
+            macro_rules! context_projection {
+                () => {{
+                    for state in states.iter_mut() {
+                        gemm_into_checked(
+                            ctx,
+                            &self.fc,
+                            &state.pending,
+                            &mut state.context_projected,
+                        )?;
+                        rms_norm_batch_into(
+                            ctx,
+                            &state.context_projected,
+                            &self.hidden_norm,
+                            DSPARK_RMS_EPS,
+                            &mut state.context_hidden,
+                        );
+                    }
+                }};
+            }
 
-            gemm_rows_into_checked(
-                ctx,
-                &layer.gate_up,
-                0,
-                DSPARK_INTER,
-                &scratch.normed,
-                &mut scratch.gate_out,
-            )?;
-            gemm_rows_into_checked(
-                ctx,
-                &layer.gate_up,
-                DSPARK_INTER,
-                DSPARK_INTER,
-                &scratch.normed,
-                &mut scratch.up_out,
-            )?;
-            silu_mul_batch_into(
-                ctx,
-                &scratch.gate_out,
-                &scratch.up_out,
-                &mut scratch.act_out,
-            )?;
-            gemm_into_checked(ctx, &layer.down, &scratch.act_out, &mut scratch.o_buf)?;
-            add_batch_into(
-                ctx,
-                &scratch.hidden,
-                &scratch.o_buf,
-                &mut scratch.hidden_out,
-            )?;
-            std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_out);
+            if active == 1 {
+                // bs=1: the single slot's prep can sit in the dense segments
+                // (nothing else touches the shared tail scratch before the
+                // dynamic middle consumes it), which is what makes the
+                // piecewise graph composition legal.
+                run_seg!(0, {
+                    embedding_batch(ctx, embed, token_ids_d, hidden)?;
+                    context_projection!();
+                    layer_prolog!(0);
+                    state_prep!(0, 0, &mut *states[0]);
+                });
+                for l in 0..DSPARK_LAYERS {
+                    state_dynamic!(l, 0, &mut *states[0]);
+                    if l + 1 < DSPARK_LAYERS {
+                        run_seg!(l + 1, {
+                            layer_tail!(l);
+                            layer_prolog!(l + 1);
+                            state_prep!(l + 1, 0, &mut *states[0]);
+                        });
+                    } else {
+                        // Final segment: last layer tail + draft head logits.
+                        run_seg!(l + 1, {
+                            layer_tail!(l);
+                            rms_norm_batch_into(
+                                ctx,
+                                hidden,
+                                &self.norm,
+                                DSPARK_RMS_EPS,
+                                logits_normed,
+                            );
+                            gemm_into_checked(ctx, lm_head, logits_normed, logits)?;
+                        });
+                    }
+                }
+            } else {
+                // bs>1 (eager, ungraphed): the tail scratch is shared across
+                // slots, so each slot's prep must be consumed by its dynamic
+                // middle before the next slot's prep overwrites it — the
+                // original per-slot interleave.
+                embedding_batch(ctx, embed, token_ids_d, hidden)?;
+                context_projection!();
+                for l in 0..DSPARK_LAYERS {
+                    layer_prolog!(l);
+                    for i in 0..active {
+                        state_prep!(l, i, &mut *states[i]);
+                        state_dynamic!(l, i, &mut *states[i]);
+                    }
+                    layer_tail!(l);
+                }
+                rms_norm_batch_into(ctx, hidden, &self.norm, DSPARK_RMS_EPS, logits_normed);
+                gemm_into_checked(ctx, lm_head, logits_normed, logits)?;
+            }
         }
-
+        if fwd_on {
+            scratch.forward_warm.insert(fwd_key);
+        }
+        // Host bookkeeping the eager path used to do inline.
         for (i, state) in states.iter_mut().enumerate() {
+            state.pending_len = 0;
+            state.pending.seq_len = 0;
             state.committed_len += context_lens[i];
         }
-
-        // Draft logits through the reused target head.
-        rms_norm_batch_into(
-            ctx,
-            &scratch.hidden,
-            &self.norm,
-            DSPARK_RMS_EPS,
-            &mut scratch.logits_normed,
-        );
-        gemm_into_checked(ctx, lm_head, &scratch.logits_normed, &mut scratch.logits)?;
 
         self.markov_propose(ctx, anchors, scratch)
     }
@@ -609,13 +738,67 @@ impl Glm52DsparkModel {
             let mut prev = scratch.prev_tokens.slice_mut(..rows);
             ctx.stream.memcpy_htod(&anchor_tokens, &mut prev)?;
         }
+        // Graph the 7-step chain: everything in the loop is pointer- and
+        // shape-static per `rows` (`step` bakes per node; anchor h2d and the
+        // d2h stay outside), so after a one-round warm-up (cuBLAS lazy
+        // workspace) it replays as ONE launch instead of ~21.
+        // DSPARK_NO_MARKOV_GRAPH=1 restores the plain loop.
+        let use_graph = std::env::var_os("DSPARK_NO_MARKOV_GRAPH").is_none();
+        if use_graph && scratch.markov_warm[rows - 1] {
+            let Glm52DsparkScratch {
+                markov_graphs,
+                w1emb,
+                bias,
+                logits,
+                prev_tokens,
+                next_tokens,
+                sampled_tokens,
+                partial_values,
+                partial_indices,
+                ..
+            } = scratch;
+            markov_graphs[rows - 1].run_or_capture(ctx, || {
+                for step in 1..block {
+                    let (prev, next): (&CudaSlice<u32>, &mut CudaSlice<u32>) = if step % 2 == 1 {
+                        (&*prev_tokens, &mut *next_tokens)
+                    } else {
+                        (&*next_tokens, &mut *prev_tokens)
+                    };
+                    embedding_batch(ctx, &self.markov_w1, prev, w1emb)?;
+                    gemm_into_checked(ctx, &self.markov_w2, w1emb, bias)?;
+                    markov_step_argmax_into(
+                        ctx,
+                        logits,
+                        bias,
+                        block,
+                        step,
+                        rows,
+                        partial_values,
+                        partial_indices,
+                        next,
+                        sampled_tokens,
+                    )?;
+                }
+                Ok(())
+            })?;
+            let sampled_view = scratch.sampled_tokens.slice(..rows * block);
+            let sampled = ctx.stream.clone_dtoh(&sampled_view)?;
+            return Ok((0..rows)
+                .map(|i| std::array::from_fn(|k| sampled[i * block + 1 + k]))
+                .collect());
+        }
+        scratch.markov_warm[rows - 1] = true;
+        // Fixed-orientation ping-pong, NOT a field swap: captured graphs bake
+        // the buffer addresses, and an odd number of swaps on an eager round
+        // for another row count would desync the anchor h2d from every
+        // already-captured chain.
         for step in 1..block {
-            embedding_batch(
-                ctx,
-                &self.markov_w1,
-                &scratch.prev_tokens,
-                &mut scratch.w1emb,
-            )?;
+            let (prev, next): (&CudaSlice<u32>, &mut CudaSlice<u32>) = if step % 2 == 1 {
+                (&scratch.prev_tokens, &mut scratch.next_tokens)
+            } else {
+                (&scratch.next_tokens, &mut scratch.prev_tokens)
+            };
+            embedding_batch(ctx, &self.markov_w1, prev, &mut scratch.w1emb)?;
             gemm_into_checked(ctx, &self.markov_w2, &scratch.w1emb, &mut scratch.bias)?;
             markov_step_argmax_into(
                 ctx,
@@ -626,10 +809,9 @@ impl Glm52DsparkModel {
                 rows,
                 &mut scratch.partial_values,
                 &mut scratch.partial_indices,
-                &mut scratch.next_tokens,
+                next,
                 &mut scratch.sampled_tokens,
             )?;
-            std::mem::swap(&mut scratch.prev_tokens, &mut scratch.next_tokens);
         }
         let sampled_view = scratch.sampled_tokens.slice(..rows * block);
         let sampled = ctx.stream.clone_dtoh(&sampled_view)?;
@@ -681,102 +863,6 @@ pub(crate) fn accept_prefix_match(proposed: &[u32], target_tokens: &[u32]) -> Ve
     committed
 }
 
-struct DsparkLayerKv {
-    k: HiddenStates,
-    v: HiddenStates,
-}
-
-/// Per-slot draft state: the draft KV over committed tokens, the pending
-/// captured-context rows not yet projected, and the per-round projected
-/// context (persists across the layer loop, so it lives here, not in the
-/// shared scratch). Everything is preallocated to `cache_len` at load — a
-/// mid-serving draft round must never hit the allocator (a transient OOM
-/// there would tear the whole engine down), and the launch-time VRAM probe
-/// already charged the full-cap footprint ([`glm52_dspark_arena_bytes`]).
-pub(crate) struct Glm52DsparkSlotState {
-    layers: Vec<DsparkLayerKv>,
-    /// Captured target hidden `[pending_len, 30720]` awaiting projection.
-    pending: HiddenStates,
-    pending_len: usize,
-    committed_len: usize,
-    context_projected: HiddenStates,
-    context_hidden: HiddenStates,
-    /// The drafter's KV capacity ([`Glm52DsparkModel::cache_len`]) — the
-    /// pending-context growth cap and the overflow guard bound.
-    cache_len: usize,
-}
-
-impl Glm52DsparkSlotState {
-    pub(crate) fn new(ctx: &DeviceContext, cache_len: usize) -> Result<Self> {
-        let mut layers = Vec::with_capacity(DSPARK_LAYERS);
-        for _ in 0..DSPARK_LAYERS {
-            layers.push(DsparkLayerKv {
-                k: HiddenStates::zeros(ctx, DSPARK_QKV_DIM, cache_len)?,
-                v: HiddenStates::zeros(ctx, DSPARK_QKV_DIM, cache_len)?,
-            });
-        }
-        let mut pending = HiddenStates::zeros(ctx, GLM52_DSPARK_CONTEXT_DIM, cache_len)?;
-        pending.seq_len = 0;
-        Ok(Self {
-            layers,
-            pending,
-            pending_len: 0,
-            committed_len: 0,
-            context_projected: HiddenStates::zeros(ctx, GLM52_HIDDEN, cache_len)?,
-            context_hidden: HiddenStates::zeros(ctx, GLM52_HIDDEN, cache_len)?,
-            cache_len,
-        })
-    }
-
-    /// Clear the slot for a new request. The KV/pending contents need no
-    /// scrubbing: `committed_len`/`pending_len` gate every read, and new
-    /// rows overwrite in place.
-    pub(crate) fn reset(&mut self) {
-        self.committed_len = 0;
-        self.pending_len = 0;
-        self.pending.seq_len = 0;
-    }
-
-    /// Append one step row's captured hidden (a `[30720]` row of the step
-    /// capture buffer) to the pending context. The buffer holds `cache_len`
-    /// rows from birth — allocation-free by construction.
-    pub(crate) fn append_captured_row(
-        &mut self,
-        ctx: &DeviceContext,
-        captured: &CudaSlice<half::bf16>,
-        row: usize,
-    ) -> Result<()> {
-        let required = self.pending_len + 1;
-        ensure!(
-            self.committed_len + required + GLM52_DSPARK_BLOCK <= self.cache_len,
-            "dspark pending context would exceed the draft cache: committed={}, pending={required}",
-            self.committed_len
-        );
-        let src =
-            captured.slice(row * GLM52_DSPARK_CONTEXT_DIM..(row + 1) * GLM52_DSPARK_CONTEXT_DIM);
-        let mut dst = self.pending.data.slice_mut(
-            self.pending_len * GLM52_DSPARK_CONTEXT_DIM..required * GLM52_DSPARK_CONTEXT_DIM,
-        );
-        ctx.stream.memcpy_dtod(&src, &mut dst)?;
-        self.pending_len = required;
-        self.pending.seq_len = required;
-        Ok(())
-    }
-
-    /// Point the projected-context pair at this round's rows. Preallocated to
-    /// `cache_len` — the bound is already enforced by the caller's overflow
-    /// guard, so exceeding it here is a bug, not a growth request.
-    fn set_context_len(&mut self, context_len: usize) -> Result<()> {
-        ensure!(
-            context_len <= self.context_projected.data.len() / GLM52_HIDDEN,
-            "dspark context length {context_len} exceeds the preallocated cap"
-        );
-        self.context_projected.seq_len = context_len;
-        self.context_hidden.seq_len = context_len;
-        Ok(())
-    }
-}
-
 /// Rank-level draft scratch, allocated once for the whole slot batch. Dense
 /// buffers hold `GLM52_MAX_BATCH_PER_RANK * block` rows; the varlen tail
 /// buffers hold one request's `context + block` rows and grow on demand.
@@ -805,6 +891,20 @@ pub(crate) struct Glm52DsparkScratch {
     prev_tokens: CudaSlice<u32>,
     next_tokens: CudaSlice<u32>,
     sampled_tokens: CudaSlice<u32>,
+    /// One captured Markov-chain graph per active row count (index `rows-1`),
+    /// plus a per-count warm flag: the first round for a count runs the plain
+    /// loop so cuBLAS's lazy workspace allocation happens outside capture.
+    markov_graphs: Vec<CudaGraphState>,
+    markov_warm: Vec<bool>,
+    /// Piecewise forward graphs (bs=1 only), keyed by **(slot identity,
+    /// context_len)** — the captured segments bake per-slot buffer pointers
+    /// (`state.pending`, `state.context_projected`, `state.context_hidden`),
+    /// so a graph captured for one slot must never replay for another. Slot
+    /// identity is the device address of the slot's `pending` buffer (stable
+    /// for the slot's lifetime; the `&mut` reference itself is not). Bounded
+    /// by `GLM52_MAX_BATCH_PER_RANK x GLM52_DSPARK_BLOCK` entries.
+    forward_graphs: std::collections::HashMap<(u64, usize), Vec<CudaGraphState>>,
+    forward_warm: std::collections::HashSet<(u64, usize)>,
 }
 
 impl Glm52DsparkScratch {
@@ -815,7 +915,7 @@ impl Glm52DsparkScratch {
         // preallocated so a draft round never touches the allocator (and the
         // VRAM probe's ledger charged exactly this).
         let tail_capacity = cache_len;
-        let partials = argmax_batch_bf16_split_partials_len(GLM52_MAX_BATCH_PER_RANK, GLM52_VOCAB);
+        let partials = markov_step_argmax_partials_len(GLM52_MAX_BATCH_PER_RANK, GLM52_VOCAB);
         Ok(Self {
             block_token_ids_h: vec![DSPARK_MASK_TOKEN; max_rows],
             token_ids_d: ctx.stream.alloc_zeros(max_rows)?,
@@ -840,6 +940,12 @@ impl Glm52DsparkScratch {
             prev_tokens: ctx.stream.alloc_zeros(GLM52_MAX_BATCH_PER_RANK)?,
             next_tokens: ctx.stream.alloc_zeros(GLM52_MAX_BATCH_PER_RANK)?,
             sampled_tokens: ctx.stream.alloc_zeros(max_rows)?,
+            markov_graphs: (0..GLM52_MAX_BATCH_PER_RANK)
+                .map(|_| CudaGraphState::new())
+                .collect(),
+            markov_warm: vec![false; GLM52_MAX_BATCH_PER_RANK],
+            forward_graphs: std::collections::HashMap::new(),
+            forward_warm: std::collections::HashSet::new(),
         })
     }
 
@@ -861,49 +967,15 @@ impl Glm52DsparkScratch {
         self.logits_normed.seq_len = block_rows;
         self.logits.seq_len = block_rows;
     }
-
-    /// Point the varlen tail buffers at this request's `context + block`
-    /// rows. Preallocated to the draft cache length — the caller's overflow
-    /// guard already bounds `tail_len`, so exceeding it is a bug.
-    fn set_tail_len(&mut self, tail_len: usize) -> Result<()> {
-        ensure!(
-            tail_len <= self.tail_input.data.len() / GLM52_HIDDEN,
-            "dspark tail length {tail_len} exceeds the preallocated cap"
-        );
-        self.tail_input.seq_len = tail_len;
-        self.k_tail.seq_len = tail_len;
-        self.v_tail.seq_len = tail_len;
-        Ok(())
-    }
 }
 
+#[path = "dspark_slot.rs"]
+mod slot;
+pub(crate) use slot::Glm52DsparkSlotState;
+
+/// Test-only constructors (`synthetic`, `randomize_for_test`) live in a
+/// child module file so this one stays under the module size budget; a child
+/// module keeps access to the private fields.
 #[cfg(test)]
-mod tests {
-    use super::accept_prefix_match;
-
-    #[test]
-    fn accepts_full_run_plus_bonus() {
-        assert_eq!(
-            accept_prefix_match(&[10, 11, 12], &[10, 11, 12, 13]),
-            vec![10, 11, 12, 13]
-        );
-    }
-
-    #[test]
-    fn accepts_prefix_then_correction() {
-        assert_eq!(
-            accept_prefix_match(&[10, 11, 99], &[10, 11, 22, 33]),
-            vec![10, 11, 22]
-        );
-    }
-
-    #[test]
-    fn rejects_first_draft_commits_the_correction() {
-        assert_eq!(accept_prefix_match(&[10, 11, 12], &[7, 8, 9, 10]), vec![7]);
-    }
-
-    #[test]
-    fn empty_proposal_commits_the_model_token() {
-        assert_eq!(accept_prefix_match(&[], &[42]), vec![42]);
-    }
-}
+#[path = "dspark_test_support.rs"]
+mod test_support;
