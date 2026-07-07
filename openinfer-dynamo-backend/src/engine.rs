@@ -30,7 +30,7 @@ use openinfer_engine::engine::{
     EngineHandle, GenerateRequest, KvBlockEvent, LoadSnapshot, TokenSink, TokenStreamReceiver,
 };
 use openinfer_qwen3::{
-    DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
+    DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_KV_PAGE_SIZE,
     DEFAULT_MAX_PREFILL_TOKENS, DecodeOverlap, Qwen3LaunchOptions, Qwen3MemoryOptions,
     Qwen3OffloadOptions,
 };
@@ -71,6 +71,9 @@ struct Args {
     /// Fraction of GPU memory the engine may use (weights + KV cache).
     #[arg(long, default_value_t = DEFAULT_GPU_MEMORY_UTILIZATION)]
     gpu_memory_utilization: f64,
+    /// KV cache page (block) size in tokens. FlashInfer only accepts 16 or 64.
+    #[arg(long, default_value_t = DEFAULT_KV_PAGE_SIZE)]
+    kv_page_size: usize,
 }
 
 pub struct OpeninferBackend {
@@ -112,6 +115,7 @@ impl OpeninferBackend {
         let memory = Qwen3MemoryOptions::new(
             args.gpu_memory_utilization,
             DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES,
+            args.kv_page_size,
         )
         .validate()
         .map_err(|e| convert::invalid_argument(format!("invalid memory options: {e:#}")))?;
