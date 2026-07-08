@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Benchmark Artifact Manifest
 
-> **TL;DR:** Issue #467 is implemented: the DeepSeek-V2-Lite retained benchmark matrix emits `artifact_manifest.json` and `regression_summary.json`, with CPU-only tests covering summarize-only regeneration and comparison edge cases.
+> **TL;DR:** Issue #467 is implemented: the DeepSeek-V2-Lite retained benchmark matrix emits `artifact_manifest.json` and `regression_summary.json`; PR #617 review follow-up is to keep regression comparability conservative for preserved setup failures and stable GPU metadata.
 >
 > **Last touched:** 2026-07
 
@@ -15,7 +15,7 @@
 
 The manifest records correctness artifacts, direct diagnostic JSON, HTTP result JSON, server logs, trace result JSON, `summary.json`, and `regression_summary.json`. Paths are artifact-bundle-relative or repo-relative when possible; external absolute model paths are reduced to `<external>/<basename>`. Command/env/log payloads continue to use the script's redaction helpers.
 
-The regression summary emits `comparability.claim_marker: "no directional claim"` when a speed/regression direction would be unsafe: no baseline, changed setup rows, changed contract/version/model probes, or noisy HTTP cells.
+The regression summary emits `comparability.claim_marker: "no directional claim"` when a speed/regression direction would be unsafe: no baseline, added/resolved/preserved setup rows, changed contract/version/model probes, or noisy HTTP cells. GPU probe comparability uses stable GPU name, driver version, and compute capability from `nvidia-smi`, ignoring temperature/clocks drift.
 
 ## Validation
 
@@ -27,7 +27,7 @@ python3 -m unittest tests/test_bench_dsv2lite_vllm_matrix.py
 python3 scripts/bench_dsv2lite_vllm_matrix.py --plan-only --baseline-summary target/benchmarks/previous/summary.json
 ```
 
-The final unit run passed `54` tests. The new coverage includes `--summarize-only` manifest/regression emission, public-safe external model paths, artifact-bundle-relative manifest paths, no-baseline `no directional claim`, failed setup resolution, and noisy HTTP cells blocking directional claims.
+The final unit run passed `57` tests. The new coverage includes `--summarize-only` manifest/regression emission, public-safe external model paths, artifact-bundle-relative manifest paths, no-baseline `no directional claim`, failed setup resolution and preservation, dynamic GPU telemetry drift, stable GPU identity changes, and noisy HTTP cells blocking directional claims.
 
 ## Notes
 

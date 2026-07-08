@@ -1498,6 +1498,8 @@ def build_regression_summary(
     setup_changes = comparison["failed_setup_rows"]
     if setup_changes["added"] or setup_changes["resolved"]:
         reasons.append("failed_setup_rows_changed")
+    if setup_changes["preserved"]:
+        reasons.append("failed_setup_rows_preserved")
     no_directional_claim = bool(reasons)
     comparison["comparability"] = {
         "comparable": not no_directional_claim,
@@ -1664,13 +1666,42 @@ def comparability_reasons(summary: dict[str, Any], baseline: dict[str, Any]) -> 
         ("benchmark_contract_changed", ("benchmark_contract",)),
         ("model_snapshot_changed", ("model", "config_sha256")),
         ("tokenizer_snapshot_changed", ("model", "tokenizer_sha256")),
-        ("gpu_probe_changed", ("versions", "nvidia_smi", "stdout")),
         ("cuda_probe_changed", ("versions", "nvcc", "stdout")),
         ("vllm_version_changed", ("versions", "vllm", "stdout")),
     ):
         if nested_get(current_meta, key_path) != nested_get(baseline_meta, key_path):
             reasons.append(label)
+    if gpu_probe_projection(current_meta) != gpu_probe_projection(baseline_meta):
+        reasons.append("gpu_probe_changed")
     return reasons
+
+
+def gpu_probe_projection(metadata_payload: dict[str, Any]) -> Any:
+    versions = metadata_payload.get("versions") if isinstance(metadata_payload, dict) else {}
+    probe = versions.get("nvidia_smi") if isinstance(versions, dict) else None
+    if not isinstance(probe, dict):
+        return None
+    if probe.get("available") is False:
+        return {"available": False}
+    stdout = probe.get("stdout")
+    if not isinstance(stdout, str):
+        return None
+    rows = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        cells = [cell.strip() for cell in line.split(",")]
+        if len(cells) >= 3:
+            rows.append({
+                "name": cells[0],
+                "driver_version": cells[1],
+                "compute_cap": cells[2],
+            })
+        else:
+            rows.append({"raw": line.strip()})
+    if rows:
+        return rows
+    return stdout.strip()
 
 
 def nested_get(payload: dict[str, Any], path: tuple[str, ...]) -> Any:

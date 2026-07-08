@@ -767,6 +767,87 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         self.assertIn("failed_setup_rows_changed", regression["comparability"]["reasons"])
         self.assertTrue(regression["comparability"]["no_directional_claim"])
 
+    def test_regression_summary_marks_preserved_failed_setup_no_directional(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary(http_failed=True)
+            baseline = self.minimal_summary(http_failed=True)
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertEqual(
+            regression["failed_setup_rows"]["preserved"][0]["key"],
+            "http_concurrency_pressure:vllm-tp2",
+        )
+        self.assertIn("failed_setup_rows_preserved", regression["comparability"]["reasons"])
+        self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
+    def test_regression_summary_ignores_dynamic_gpu_probe_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary()
+            baseline = self.minimal_summary()
+            current["metadata"]["versions"]["nvidia_smi"]["stdout"] = (
+                "NVIDIA GeForce RTX 5090, 580.95.05, 12.0, 63, 2550\n"
+                "NVIDIA GeForce RTX 5090, 580.95.05, 12.0, 61, 2490"
+            )
+            baseline["metadata"]["versions"]["nvidia_smi"]["stdout"] = (
+                "NVIDIA GeForce RTX 5090, 580.95.05, 12.0, 42, 2100\n"
+                "NVIDIA GeForce RTX 5090, 580.95.05, 12.0, 40, 1980"
+            )
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertNotIn("gpu_probe_changed", regression["comparability"]["reasons"])
+        self.assertEqual(regression["comparability"]["claim_marker"], "directional comparison allowed")
+
+    def test_regression_summary_detects_stable_gpu_probe_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary()
+            baseline = self.minimal_summary()
+            current["metadata"]["versions"]["nvidia_smi"]["stdout"] = (
+                "NVIDIA GeForce RTX 5090, 580.95.05, 12.0, 63, 2550"
+            )
+            baseline["metadata"]["versions"]["nvidia_smi"]["stdout"] = (
+                "NVIDIA GeForce RTX 4090, 580.95.05, 8.9, 42, 2100"
+            )
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertIn("gpu_probe_changed", regression["comparability"]["reasons"])
+        self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
     def test_regression_summary_marks_noisy_http_cell_no_directional(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
