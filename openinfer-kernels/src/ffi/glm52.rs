@@ -90,6 +90,7 @@ unsafe extern "C" {
         q_pe_base: *const Half,
         q_pe_offset: i32,
         q_pe_head_stride: i32,
+        num_q_heads: i32,
         cos: *const Half,
         sin: *const Half,
         query: *mut Half,
@@ -317,9 +318,6 @@ unsafe extern "C" {
         w2: *const u8,
         w2_scale: *const f32,
         mlp_out: *mut Half,
-        xg: *mut Half,
-        topk_all_idx: *mut i32,
-        topk_all_prob: *mut f32,
         guidx: *mut i32,
         guprob: *mut f32,
         gucnt: *mut i32,
@@ -327,21 +325,34 @@ unsafe extern "C" {
         bpart: *mut f32,
         ug: *mut Half,
         cpart: *mut f32,
-        ag_local: *mut std::ffi::c_void,
         rs_local: *mut std::ffi::c_void,
-        peer_ag: *const *const std::ffi::c_void,
         peer_rs: *const *const std::ffi::c_void,
         epoch_dev: *mut u64,
+        active_rows: *const i32,
         layer_slot: i32,
         nranks: i32,
         myrank: i32,
-        span_owner_dev: *const i32,
         grid_blocks: i32,
         stream: CUstream,
     ) -> CUresult;
 
     pub fn glm52_moe_tp8_epoch_advance_cuda(
         epoch_dev: *mut std::ffi::c_void,
+        stream: CUstream,
+    ) -> CUresult;
+
+    // --- TP8 attention allreduce: o_proj/dense-down epilogue collective -----
+    pub fn glm52_tp8_ar_launch_cuda(
+        partial: *const Half,
+        out: *mut Half,
+        ar_local: *mut std::ffi::c_void,
+        peer_ar: *const *const std::ffi::c_void,
+        epoch_dev: *const u64,
+        active_rows: *const i32,
+        layer_slot: i32,
+        rows: i32,
+        nranks: i32,
+        myrank: i32,
         stream: CUstream,
     ) -> CUresult;
 }

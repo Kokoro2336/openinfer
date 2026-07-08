@@ -1,12 +1,9 @@
-//! GLM5.2 bucket-1 TP8 MoE: per-rank 1/8-intermediate slices of ALL 257
-//! experts (shared folded at bank index 256) + the whole-layer cooperative
-//! kernel state (LL packet buffers, cross-rank pointer exchange, scratch
-//! arena). Design: `docs/models/glm52/moe-tp8-low-latency.md`.
-//!
-//! TP8 slices are a second-pass load: the streaming loader only brings this
-//! rank's 32-expert EP8 bundle, so pilot layers re-read every expert's
-//! checkpoint tensors and keep BOTH banks resident (bucket-1 graphs take the
-//! TP8 kernel, larger buckets keep the EP8 dispatch/combine chain).
+//! GLM5.2 TP8 MoE: per-rank 1/8-intermediate slices of ALL 257 experts
+//! (shared folded at bank index 256) + the phase-kernel chain state (LL
+//! packet buffers, cross-rank pointer exchange, scratch arena). Replicated
+//! activations: every rank passes all 8 rows and receives all 8 reduced
+//! rows back, bit-identical. Design:
+//! `docs/models/glm52/moe-tp8-low-latency.md`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,26 +14,25 @@ use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
-    GLM52_TP8_AG_PACKETS, GLM52_TP8_AG_SLOT_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN,
-    GLM52_TP8_CPART_LEN, GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_SLOT_PACKETS,
-    GLM52_TP8_SLICE_I, GLM52_TP8_SLICE_ROWS, GLM52_TP8_TOPK, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX,
-    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, Glm52Tp8RowMap, glm52_moe_tp8_epoch_advance,
-    glm52_moe_tp8_layer_launch, glm52_moe_tp8_max_blocks,
+    GLM52_TP8_AR_CHUNK_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN, GLM52_TP8_CPART_LEN,
+    GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_SLOT_PACKETS, GLM52_TP8_SLICE_I,
+    GLM52_TP8_SLICE_ROWS, GLM52_TP8_TOKENS, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX,
+    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, glm52_moe_tp8_epoch_advance, glm52_moe_tp8_layer_launch,
+    glm52_moe_tp8_max_blocks, glm52_tp8_ar_buffer_bytes, glm52_tp8_ar_launch,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
 use crate::config::{GLM52_EXPERT_INTERMEDIATE as INTERMEDIATE, GLM52_HIDDEN};
-use crate::moe_decode::{
-    EXPERTS, Glm52RouterScratch, QUANT_GROUP, W2_K, W2_N, W2_SCALE_COLS, W2_SCALE_ROWS,
-};
+use crate::moe_decode::{EXPERTS, QUANT_GROUP, W2_K, W2_N, W2_SCALE_COLS, W2_SCALE_ROWS};
 use crate::weights::{Glm52WeightManifest, expected_tensor_contract, mmap_file, retype_owned};
 
 const H: usize = GLM52_TP8_HIDDEN;
 const RANKS: usize = GLM52_TP8_RANKS;
 
-// The span shape assumes the scheduler's largest bucket IS the kernel's row
-// count: a bigger bucket would pass every >= buffer ensure while the kernel
-// silently computes only 8 rows (stale mlp_out on the rest).
+// The replicated shape assumes the scheduler's largest bucket IS the
+// kernel's row count: a bigger bucket would pass every >= buffer ensure
+// while the kernel silently computes only 8 rows (stale mlp_out on the
+// rest).
 const _: () =
     assert!(crate::model::GLM52_MAX_BATCH_PER_RANK == openinfer_kernels::ops::GLM52_TP8_TOKENS);
 const BANK: usize = GLM52_TP8_BANK_EXPERTS;
@@ -245,11 +241,12 @@ pub(crate) fn load_tp8_slice_layer(
 }
 
 /// One rank's published LL buffer mappings: per-accessor VA tables (indexed
-/// by fleet device ordinal) for its AG and RS buffers.
+/// by fleet device ordinal) for its MoE all-reduce buffer and its attention
+/// (o_proj epilogue) all-reduce buffer.
 #[derive(Clone, Copy)]
 struct Glm52Tp8LlVas {
-    ag: [u64; RANKS],
     rs: [u64; RANKS],
+    ar: [u64; RANKS],
 }
 
 /// Cross-rank rendezvous for LL buffer mappings: every rank publishes its
@@ -354,10 +351,8 @@ impl Glm52Tp8Exchange {
     }
 }
 
-/// A rank's complete TP8 pilot: the runtime state plus the per-layer slice
-/// banks (keyed by absolute layer index). Lives beside the EP8 state in the
-/// rank runtime — both topologies stay resident and the bucket size picks
-/// the path at capture time.
+/// A rank's complete TP8 MoE runtime: the state plus the per-layer slice
+/// banks (keyed by absolute layer index).
 pub(crate) struct Glm52MoeTp8Rank {
     pub(crate) state: Glm52MoeTp8State,
     pub(crate) slices: BTreeMap<usize, Glm52MoeTp8SliceBank>,
@@ -365,8 +360,7 @@ pub(crate) struct Glm52MoeTp8Rank {
 
 impl Glm52MoeTp8Rank {
     /// This layer's TP8 pieces: runtime state, LL slot index (the layer's
-    /// position among this rank's sliced layers), and slice bank. `None`
-    /// when the layer has no slice bank (pilot mode covers a subset).
+    /// position among this rank's sliced layers), and slice bank.
     pub(crate) fn layer_bank(
         &mut self,
         layer: usize,
@@ -385,17 +379,20 @@ pub(crate) struct Glm52MoeTp8State {
     rank: usize,
     grid_blocks: usize,
     // LL buffers stay alive as long as peers may write into them.
-    _ag: Glm52Tp8LlBuffer,
     _rs: Glm52Tp8LlBuffer,
-    ag_local: u64,
+    _ar: Glm52Tp8LlBuffer,
     rs_local: u64,
-    peer_ag: [u64; RANKS],
+    ar_local: u64,
     peer_rs: [u64; RANKS],
+    peer_ar: [u64; RANKS],
     epoch_dev: CudaSlice<u64>,
-    span_owner_dev: CudaSlice<i32>,
-    xg: CudaSlice<bf16>,
-    topk_all_idx: CudaSlice<i32>,
-    topk_all_prob: CudaSlice<f32>,
+    // Want-mask: leading-active row count all TP8 kernels of a step read at
+    // replay time. Staged host-side once per step (like the old span-owner
+    // staging), identically on every rank — LL push/wait symmetry. Production
+    // always stages before use (pre-capture stages 0: push nothing, wait on
+    // nothing); the full-bucket initial value serves the oracle gates, which
+    // launch these kernels without staging.
+    active_rows_dev: CudaSlice<i32>,
     guidx: CudaSlice<i32>,
     guprob: CudaSlice<f32>,
     gucnt: CudaSlice<i32>,
@@ -412,13 +409,17 @@ impl Glm52MoeTp8State {
         device_ordinal: usize,
         exchange: &Glm52Tp8Exchange,
         slots: usize,
+        ar_slots: usize,
     ) -> Result<Self> {
         // Everything fallible before the exchange runs inside this closure so
         // its error is PUBLISHED as the poison pill — a rank that bails
         // without publishing would hang the other 7 in the rendezvous.
         let prep = (|| -> Result<(Glm52Tp8LlBuffer, Glm52Tp8LlBuffer)> {
             ensure!(rank < RANKS, "TP8 rank {rank} out of range");
-            ensure!(slots > 0, "TP8 state needs at least one layer slot");
+            ensure!(
+                slots > 0 && ar_slots > 0,
+                "TP8 state needs at least one layer slot (moe {slots}, ar {ar_slots})"
+            );
             // GLM5.2's DP fleet is device ordinals 0..8 (enforced at launch),
             // so the per-accessor VA tables index directly by device ordinal.
             ensure!(
@@ -426,54 +427,50 @@ impl Glm52MoeTp8State {
                 "TP8 device ordinal {device_ordinal} outside the 0..8 fleet"
             );
             let fleet: Vec<usize> = (0..RANKS).collect();
-            let ag = Glm52Tp8LlBuffer::alloc(slots * GLM52_TP8_AG_SLOT_PACKETS * 16, &fleet)?;
             let rs = Glm52Tp8LlBuffer::alloc(slots * GLM52_TP8_RS_SLOT_PACKETS * 16, &fleet)?;
-            Ok((ag, rs))
+            let ar = Glm52Tp8LlBuffer::alloc(glm52_tp8_ar_buffer_bytes(ar_slots), &fleet)?;
+            Ok((rs, ar))
         })();
         let vas = prep
             .as_ref()
-            .map(|(ag, rs)| Glm52Tp8LlVas {
-                ag: std::array::from_fn(|a| ag.addr_for(a)),
+            .map(|(rs, ar)| Glm52Tp8LlVas {
                 rs: std::array::from_fn(|a| rs.addr_for(a)),
+                ar: std::array::from_fn(|a| ar.addr_for(a)),
             })
             .map_err(|err| format!("{err:#}"));
         let table = exchange.publish_and_wait(rank, vas)?;
-        let (ag, rs) = prep.expect("own failure would have surfaced via publish_and_wait");
+        let (rs, ar) = prep.expect("own failure would have surfaced via publish_and_wait");
         // Peer pointers: THIS device's VA for peer p's buffer (per-accessor
         // mapping — see `Glm52Tp8LlBuffer`), pre-offset to this rank's
-        // source-rank slot. Kernel buffer layout is [parity][src_rank][packet]
-        // (the kernel adds the parity offset itself), so the slot stride is
-        // one rank's packet count x 16 B.
-        // Per-SRC strides: peer pointers are baked to this rank's source slot.
-        // AG region is [parity][src][packets]; RS region is [parity][row]
-        // [src][hidden] (the kernel adds the row stride itself), so the src
-        // stride is one hidden row of packets in both mappings.
-        let ag_slot = GLM52_TP8_AG_PACKETS * 16;
+        // source-rank slot. The MoE region is [parity][row][src][hidden] (the
+        // kernel adds the parity and row strides itself), so the src stride
+        // is one hidden row of packets; the AR region's src stride is one
+        // chunk of packets (see `GLM52_TP8_AR_CHUNK_PACKETS`).
         let rs_slot = GLM52_TP8_HIDDEN * 16;
-        let peer_ag =
-            std::array::from_fn(|p| table[p].ag[device_ordinal] + (rank * ag_slot) as u64);
+        let ar_slot = GLM52_TP8_AR_CHUNK_PACKETS * 16;
         let peer_rs =
             std::array::from_fn(|p| table[p].rs[device_ordinal] + (rank * rs_slot) as u64);
+        let peer_ar =
+            std::array::from_fn(|p| table[p].ar[device_ordinal] + (rank * ar_slot) as u64);
         // Epoch starts at 1: the LL buffers are zeroed, and a zero tag must
         // never match a live epoch.
         let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;
         ctx.stream.memcpy_htod(&[1u64], &mut epoch_dev)?;
-        let span_owner_dev = ctx.stream.alloc_zeros::<i32>(1)?;
+        let mut active_rows_dev = ctx.stream.alloc_zeros::<i32>(1)?;
+        ctx.stream
+            .memcpy_htod(&[GLM52_TP8_TOKENS as i32], &mut active_rows_dev)?;
         let grid_blocks = glm52_moe_tp8_max_blocks()?;
         Ok(Self {
             rank,
             grid_blocks,
-            ag_local: ag.addr_for(device_ordinal),
             rs_local: rs.addr_for(device_ordinal),
-            _ag: ag,
+            ar_local: ar.addr_for(device_ordinal),
             _rs: rs,
-            peer_ag,
+            _ar: ar,
             peer_rs,
+            peer_ar,
             epoch_dev,
-            span_owner_dev,
-            xg: ctx.stream.alloc_zeros(RANKS * H)?,
-            topk_all_idx: ctx.stream.alloc_zeros(RANKS * GLM52_TP8_TOPK)?,
-            topk_all_prob: ctx.stream.alloc_zeros(RANKS * GLM52_TP8_TOPK)?,
+            active_rows_dev,
             guidx: ctx.stream.alloc_zeros(GLM52_TP8_UNION_MAX)?,
             guprob: ctx.stream.alloc_zeros(GLM52_TP8_UNION_MAX * RANKS)?,
             gucnt: ctx.stream.alloc_zeros(1)?,
@@ -490,74 +487,57 @@ impl Glm52MoeTp8State {
         glm52_moe_tp8_epoch_advance(ctx, &mut self.epoch_dev)
     }
 
-    /// Stage the span owner for this step's replay — once per span step,
-    /// BEFORE the graph launch (every span layer kernel reads it at run
-    /// time, so one captured span graph serves any owner).
-    pub(crate) fn stage_span_owner(&mut self, ctx: &DeviceContext, owner: usize) -> Result<()> {
-        ensure!(owner < RANKS, "TP8 span owner {owner} out of range");
+    /// Stage the want-mask for the next replayed step: rows `[0, active)` of
+    /// the bucket are real, the rest are pads (the plan packs actives as a
+    /// prefix). Host-side write OUTSIDE the graph — every rank must stage the
+    /// same value before replay (pads skip the LL wire on all ranks alike).
+    /// Zero is the graph pre-capture shape (all rows pads): the kernels then
+    /// push nothing and wait on nothing, so capture pairs trivially.
+    pub(crate) fn stage_active_rows(&mut self, ctx: &DeviceContext, active: usize) -> Result<()> {
+        ensure!(
+            active <= GLM52_TP8_TOKENS,
+            "TP8 active rows {active} exceeds the bucket {GLM52_TP8_TOKENS}"
+        );
         ctx.stream
-            .memcpy_htod(&[owner as i32], &mut self.span_owner_dev)?;
+            .memcpy_htod(&[active as i32], &mut self.active_rows_dev)?;
         Ok(())
     }
 
-    /// One layer's TP8 MoE for this rank's single token (bucket-1 only): the
-    /// production router already ran (`router.route` holds the top-8), and
-    /// `mlp_out` receives routed + shared like the EP8 arm's closing add.
-    /// `slot` is the layer's LL buffer region (its index among this rank's
-    /// pilot layers).
-    pub(crate) fn forward(
+    /// All-reduce `rows` rows of a head-sharded projection partial (the
+    /// attention o_proj epilogue): every rank contributes `partial` and ends
+    /// with the bit-identical sum in `out`. `layer_slot` is the decoder layer
+    /// index (each layer owns one AR slot region); shares the step epoch with
+    /// the MoE chain — [`Self::advance_epoch`] once per step covers both.
+    pub(crate) fn attn_ar_launch(
         &mut self,
         ctx: &DeviceContext,
-        slot: usize,
-        bank: &Glm52MoeTp8SliceBank,
-        normed2: &CudaSlice<bf16>,
-        router: &Glm52RouterScratch,
-        mlp_out: &mut CudaSlice<bf16>,
+        layer_slot: usize,
+        rows: usize,
+        partial: &CudaSlice<bf16>,
+        out: &mut CudaSlice<bf16>,
     ) -> Result<()> {
-        debug_assert_eq!(GLM52_HIDDEN, H);
-        let mut bufs = Glm52MoeTp8Buffers {
-            xg: &mut self.xg,
-            topk_all_idx: &mut self.topk_all_idx,
-            topk_all_prob: &mut self.topk_all_prob,
-            guidx: &mut self.guidx,
-            guprob: &mut self.guprob,
-            gucnt: &mut self.gucnt,
-            gused: &mut self.gused,
-            bpart: &mut self.bpart,
-            ug: &mut self.ug,
-            cpart: &mut self.cpart,
-            ag_local: self.ag_local,
-            rs_local: self.rs_local,
-            peer_ag: self.peer_ag,
-            peer_rs: self.peer_rs,
-            epoch_dev: &mut self.epoch_dev,
-        };
-        glm52_moe_tp8_layer_launch(
+        glm52_tp8_ar_launch(
             ctx,
-            slot,
-            Glm52Tp8RowMap::Dp8,
-            normed2,
-            &router.route.topk_idx,
-            &router.route.topk_weight,
-            &bank.w13,
-            &bank.w13_scale,
-            &bank.w2,
-            &bank.w2_scale,
-            mlp_out,
-            &mut bufs,
+            layer_slot,
+            rows,
+            partial,
+            out,
+            self.ar_local,
+            self.peer_ar,
+            &self.epoch_dev,
+            Some(&self.active_rows_dev),
             self.rank,
-            self.grid_blocks,
         )
     }
 
-    /// Span-mode layer forward: all 8 rows (1 committed + 7 drafts) belong
-    /// to the rank staged via [`Self::stage_span_owner`] (once per step,
-    /// before the first span layer). Every rank passes 8-row buffers: the
-    /// kernels read the inputs only on the owner, whose `mlp_out` receives
-    /// 8 rows of routed + shared; the other ranks' `mlp_out` is zero-filled
-    /// (pads never enter the MoE).
+    /// One layer's TP8 MoE over ALL `GLM52_TP8_TOKENS` rows (replicated
+    /// activations): `normed2`/`topk_*` carry every global row and must be
+    /// bit-identical across ranks; `mlp_out` receives all rows of routed +
+    /// shared (like the EP8 arm's closing add), bit-identical across ranks.
+    /// `slot` is the layer's LL buffer region (its index among this rank's
+    /// sliced layers).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_span(
+    pub(crate) fn forward(
         &mut self,
         ctx: &DeviceContext,
         slot: usize,
@@ -568,10 +548,8 @@ impl Glm52MoeTp8State {
         mlp_out: &mut CudaSlice<bf16>,
     ) -> Result<()> {
         debug_assert_eq!(GLM52_HIDDEN, H);
+        debug_assert_eq!(GLM52_TP8_TOKENS, RANKS);
         let mut bufs = Glm52MoeTp8Buffers {
-            xg: &mut self.xg,
-            topk_all_idx: &mut self.topk_all_idx,
-            topk_all_prob: &mut self.topk_all_prob,
             guidx: &mut self.guidx,
             guprob: &mut self.guprob,
             gucnt: &mut self.gucnt,
@@ -579,18 +557,14 @@ impl Glm52MoeTp8State {
             bpart: &mut self.bpart,
             ug: &mut self.ug,
             cpart: &mut self.cpart,
-            ag_local: self.ag_local,
             rs_local: self.rs_local,
-            peer_ag: self.peer_ag,
             peer_rs: self.peer_rs,
             epoch_dev: &mut self.epoch_dev,
+            active_rows: Some(&self.active_rows_dev),
         };
         glm52_moe_tp8_layer_launch(
             ctx,
             slot,
-            Glm52Tp8RowMap::Span {
-                owner_dev: &self.span_owner_dev,
-            },
             normed2,
             topk_idx,
             topk_prob,

@@ -192,7 +192,8 @@ fn run_layer_prefill_ep8(
 
     let mqa_shape =
         Glm52IndexerScratch::decode_shape(1, index_cache_layout, index_blocks, NUM_SMS, oracle_ctx);
-    let mut scratch = Glm52DecodeScratch::new(ctx, &contract, mqa_shape)?;
+    let mut scratch =
+        Glm52DecodeScratch::new(ctx, &contract, mqa_shape, crate::config::GLM52_HEADS)?;
 
     let mut outputs = Vec::with_capacity(oracle_ctx * HIDDEN);
     for position in 0..oracle_ctx {
@@ -240,6 +241,7 @@ fn run_layer_prefill_ep8(
             &mut carry_ready,
             0,
             true,
+            None,
         )?;
         let route = run_router(ctx, &moe.router, scratch.layer.normed2.data())?;
         let dispatched = glm52_moe_ep8_routed_forward(

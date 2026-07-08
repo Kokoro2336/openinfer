@@ -250,7 +250,6 @@ pub(crate) struct Glm52RankModel {
     /// Built with `--moe-topo tp8`: every MoE arm is `MoeTp8`, bucket-8
     /// steps are span steps (all 8 rows one owner rank), and the
     /// coordinator must stage the span owner on every such step.
-    tp8_topo: bool,
     slot_mapping: CudaSlice<i64>,
     seq_lens: CudaSlice<i32>,
     /// Device-resident rope tables for every position (`[max_model_len,
@@ -393,7 +392,13 @@ impl Glm52RankModel {
         w: &mut Glm52RankGpuWeights,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
+        attn_shard: Option<usize>,
     ) -> Result<Self> {
+        ensure!(
+            (moe_topo == crate::Glm52MoeTopo::Tp8) == attn_shard.is_some(),
+            "GLM5.2 attention-TP shard must ride the tp8 topology (topo {moe_topo:?}, \
+             shard {attn_shard:?})"
+        );
         ensure!(
             max_model_len > 0 && max_model_len.is_multiple_of(GLM52_MODEL_LEN_ALIGN),
             "GLM5.2 max_model_len {max_model_len} must be a positive multiple of \
@@ -421,7 +426,7 @@ impl Glm52RankModel {
         let mut caches = Vec::with_capacity(GLM52_LAYERS);
         for layer in 0..GLM52_LAYERS {
             layers.push(
-                build::build_decoder_layer(ctx, w, layer, moe_topo)
+                build::build_decoder_layer(ctx, w, layer, moe_topo, attn_shard)
                     .with_context(|| format!("build GLM5.2 decoder layer {layer}"))?,
             );
             caches.push(Glm52LayerCaches {
@@ -484,6 +489,13 @@ impl Glm52RankModel {
         // (num_blocks is cache geometry, not batch, so it carries over),
         // plans, scratch, and a zeroed block table (never read before the
         // first step prologue uploads the coordinator's page rows).
+        // Attention-TP: the shard keeps 8 of 64 heads per rank; every scratch
+        // buffer with a head dimension shrinks with it.
+        let mla_heads = if attn_shard.is_some() {
+            crate::config::GLM52_HEADS / 8
+        } else {
+            crate::config::GLM52_HEADS
+        };
         let mut buckets = Vec::with_capacity(GLM52_DECODE_BUCKETS.len());
         for rows in GLM52_DECODE_BUCKETS {
             let contract_rows = Glm52FlashMlaSparseDecode {
@@ -508,7 +520,7 @@ impl Glm52RankModel {
                     Glm52MlaSchedMetadata::new(ctx, contract_rows)?,
                     Glm52MlaSchedMetadata::new(ctx, contract_rows_short)?,
                 ],
-                scratch: Glm52DecodeScratch::new(ctx, &contract_rows, mqa_shape)?,
+                scratch: Glm52DecodeScratch::new(ctx, &contract_rows, mqa_shape, mla_heads)?,
                 graphs: [CudaGraphState::new(), CudaGraphState::new()],
                 block_table: bucket_table,
                 // Read only after a D2H lands in them (the write-combined
@@ -573,7 +585,6 @@ impl Glm52RankModel {
             buckets,
             table_width,
             max_model_len,
-            tp8_topo: moe_topo == crate::Glm52MoeTopo::Tp8,
             slot_mapping: ctx.stream.alloc_zeros::<i64>(batch)?,
             seq_lens: ctx.stream.alloc_zeros::<i32>(batch)?,
             cos_table: DeviceMatrix {
@@ -645,12 +656,6 @@ impl Glm52RankModel {
             "GLM5.2 sampling rows cannot ride a launch-ahead step (the speculation feeds the \
              argmax token, not the sampled one)"
         );
-        // Span steps change shape every round, so they can never be the
-        // repeated-shape speculation a launch-ahead lease promises.
-        ensure!(
-            flags.tp8_span_owner.is_none() || (!flags.consume && !flags.lease),
-            "GLM5.2 span step cannot ride a launch-ahead lease"
-        );
         let batch = shape.bucket;
         if flags.consume {
             // Launch-ahead fast path: the coordinator says this step IS the
@@ -682,16 +687,7 @@ impl Glm52RankModel {
             // a global grant), so the stale replay's collectives pair up and
             // it degrades to a harmless recompute the prologue overwrites.
             self.speculated = None;
-            self.decode_step_prologue_and_replay(
-                ctx,
-                aux,
-                ep8,
-                tp8,
-                inputs,
-                shape,
-                kv,
-                flags.tp8_span_owner,
-            )?;
+            self.decode_step_prologue_and_replay(ctx, aux, ep8, tp8, inputs, shape, kv)?;
         }
         let mut outputs = self.decode_step_harvest(ctx, inputs, shape, flags.lease)?;
         self.sample_rows_into(ctx, shape, sampling, seed, &mut outputs)?;
@@ -792,24 +788,7 @@ impl Glm52RankModel {
         inputs: &[(u32, usize); GLM52_MAX_BATCH_PER_RANK],
         shape: Glm52StepShape,
         kv: &Glm52StepKv,
-        span_owner: Option<u8>,
     ) -> Result<()> {
-        // TP8 span step: stage the owner BEFORE any capture or replay — the
-        // span kernels read it from device memory at run time, so one
-        // captured bucket-8 graph serves whichever rank holds the request.
-        let tp8_span = self.tp8_topo && shape.bucket == GLM52_MAX_BATCH_PER_RANK;
-        ensure!(
-            tp8_span == span_owner.is_some(),
-            "GLM5.2 span-owner flag desync: tp8_topo={}, bucket={}, owner={span_owner:?}",
-            self.tp8_topo,
-            shape.bucket
-        );
-        if let Some(owner) = span_owner {
-            let rank = tp8
-                .as_deref_mut()
-                .context("GLM5.2 span step without TP8 state")?;
-            rank.state.stage_span_owner(ctx, owner as usize)?;
-        }
         // The bucket state's `rows` is the lookup key — an unknown bucket is
         // a coordinator bug and fails the step before touching the GPU.
         let bucket = self
@@ -902,6 +881,17 @@ impl Glm52RankModel {
         // rows ride the padding page).
         ctx.stream
             .memcpy_htod(&kv.pages[..], &mut bucket.block_table)?;
+        // Want-mask for the TP8 kernels: pad rows (>= active_rows, a prefix
+        // by plan construction) skip the LL wire and shrink the expert union.
+        // Every rank stages the same value — the coordinator mirrors the
+        // step, and LL push/wait symmetry depends on it. A leased replay
+        // (consume path) skips this prologue, which is safe: the lease
+        // guarantees the identical shape, so the staged value still holds.
+        if let Some(rank) = tp8.as_deref_mut() {
+            if !rank.slices.is_empty() {
+                rank.state.stage_active_rows(ctx, shape.active_rows)?;
+            }
+        }
 
         // Attention tier: while EVERY forwarded row's context fits in the
         // short top-k, top-256 selects exactly the same tokens as top-2048
@@ -951,7 +941,6 @@ impl Glm52RankModel {
                 &step,
                 s,
                 global_tokens,
-                tp8_span,
             )
         });
         bucket.graphs[tier] = graph;
@@ -979,18 +968,14 @@ fn run_step_body(
     step: &Glm52DecodeStep<'_>,
     s: &mut Glm52DecodeScratch,
     global_tokens: usize,
-    tp8_span: bool,
 ) -> Result<()> {
     let batch = step.mla_sched.batch();
     // TP8 step head: advance the shared LL epoch exactly once per replayed
     // step that runs TP8 kernels (all TP8 layers of the step share the tag;
-    // per-layer slot regions alternate parity across steps). bucket-1 covers
-    // both the tp8 topology and the pilot; a span step is bucket-8.
-    if batch == 1 || tp8_span {
-        if let Some(rank) = tp8.as_deref_mut() {
-            if !rank.slices.is_empty() {
-                rank.state.advance_epoch(ctx)?;
-            }
+    // per-layer slot regions alternate parity across steps).
+    if let Some(rank) = tp8.as_deref_mut() {
+        if !rank.slices.is_empty() {
+            rank.state.advance_epoch(ctx)?;
         }
     }
     glm52_embed_into(ctx, embed, token_ids, &mut s.hidden)?;
@@ -1009,6 +994,16 @@ fn run_step_body(
     let mut carry_ready = false;
     for (layer, (weights, cache)) in layers.iter().zip(caches.iter_mut()).enumerate() {
         let parity = layer % 2;
+        // Attention-TP: a head-sharded layer's o_proj partial crosses the AR
+        // brick inside the attention half; the layer index is its AR slot.
+        let tp8_ar = if weights.mla.heads != crate::config::GLM52_HEADS {
+            let rank = tp8
+                .as_deref_mut()
+                .context("GLM5.2 sharded attention without TP8 state")?;
+            Some((&mut rank.state, layer))
+        } else {
+            None
+        };
         glm52_layer_attention_half(
             ctx,
             Some(aux),
@@ -1019,6 +1014,7 @@ fn run_step_body(
             &mut carry_ready,
             parity,
             layer == 0,
+            tp8_ar,
         )
         .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
         match &weights.mlp {
@@ -1030,45 +1026,18 @@ fn run_step_body(
                 s.layer.mlp_out.data_mut(),
             )?,
             Glm52LayerMlp::MoeEp8(moe) => {
-                // TP8 pilot: at bucket-1 a pilot layer takes the whole-layer
-                // cooperative kernel (allgather + all-expert slice mma +
-                // reduce-scatter, shared expert folded in) instead of the
-                // EP8 dispatch/combine chain. Same router, same `mlp_out`
-                // contract — larger buckets keep EP8 below.
-                let tp8_layer = if batch == 1 {
-                    tp8.as_deref_mut().and_then(|rank| rank.layer_bank(layer))
-                } else {
-                    None
-                };
-                if let Some((tp8_state, slot, bank)) = tp8_layer {
-                    run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
-                    tp8_state
-                        .forward(
-                            ctx,
-                            slot,
-                            bank,
-                            s.layer.normed2.data(),
-                            &s.router,
-                            s.layer.mlp_out.data_mut(),
-                        )
-                        .with_context(|| format!("GLM5.2 layer {layer} TP8 MoE"))?;
-                    // `mlp_out` already holds routed + shared — fall through
-                    // to the closing add below the match.
-                } else {
-                    glm52_moe_ep8_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
-                        .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
-                }
+                glm52_moe_ep8_layer(ctx, aux, ep8, moe, s, batch, global_tokens)
+                    .with_context(|| format!("GLM5.2 layer {layer} EP8 MoE"))?;
             }
             Glm52LayerMlp::MoeTp8(router) => {
-                // TP8 topology: every MoE layer runs the phase-kernel chain.
-                // bucket-1 = dp8 mapping (one row per rank); bucket-8 = span
-                // mapping (all 8 rows on the device-staged owner rank — the
-                // prologue staged it before this replay). Any other bucket
-                // is a scheduler bug.
+                // TP8 topology: every MoE layer runs the replicated
+                // phase-kernel chain over ALL 8 global rows — the topology
+                // serves exactly one shape (bucket-8; pad rows ride free
+                // slots). Any other bucket is a scheduler bug.
                 ensure!(
-                    batch == 1 || tp8_span,
-                    "GLM5.2 TP8 topology stepped at bucket {batch} without a span mapping — \
-                     the scheduler must pin bucket-1 or plan a span-8 step"
+                    batch == GLM52_MAX_BATCH_PER_RANK,
+                    "GLM5.2 TP8 topology stepped at bucket {batch} — replicated activations \
+                     serve the single bucket-{GLM52_MAX_BATCH_PER_RANK} shape"
                 );
                 let (state, slot, bank) = tp8
                     .as_deref_mut()
@@ -1076,34 +1045,21 @@ fn run_step_body(
                     .with_context(|| {
                         format!("GLM5.2 TP8 layer {layer} has no slice bank — loader drifted")
                     })?;
-                // Every rank routes its own rows (uniform graph content; in
-                // span mode only the owner's routing is consumed by the
-                // kernels, pad ranks' routing is dead weight by design).
+                // Every rank routes all rows locally — bit-identical across
+                // ranks (same kernel, same replicated normed2), so the
+                // kernel's union and prob table need no routing exchange.
                 run_router_into(ctx, router, s.layer.normed2.data(), &mut s.router)?;
-                if tp8_span {
-                    state
-                        .forward_span(
-                            ctx,
-                            slot,
-                            bank,
-                            s.layer.normed2.data(),
-                            &s.router.route.topk_idx,
-                            &s.router.route.topk_weight,
-                            s.layer.mlp_out.data_mut(),
-                        )
-                        .with_context(|| format!("GLM5.2 layer {layer} TP8 span MoE"))?;
-                } else {
-                    state
-                        .forward(
-                            ctx,
-                            slot,
-                            bank,
-                            s.layer.normed2.data(),
-                            &s.router,
-                            s.layer.mlp_out.data_mut(),
-                        )
-                        .with_context(|| format!("GLM5.2 layer {layer} TP8 MoE"))?;
-                }
+                state
+                    .forward(
+                        ctx,
+                        slot,
+                        bank,
+                        s.layer.normed2.data(),
+                        &s.router.route.topk_idx,
+                        &s.router.route.topk_weight,
+                        s.layer.mlp_out.data_mut(),
+                    )
+                    .with_context(|| format!("GLM5.2 layer {layer} TP8 MoE"))?;
             }
             #[cfg(test)]
             Glm52LayerMlp::Moe(_) => {

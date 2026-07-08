@@ -16,9 +16,11 @@
 // them for these lints would churn on every regeneration.
 #![allow(clippy::unreadable_literal, clippy::excessive_precision)]
 
+mod attn_tp;
 mod bookend;
 mod indexer;
 mod layer;
 mod layer_ep8;
 mod layer_tp8;
 mod mla;
+mod tp8_ar;
