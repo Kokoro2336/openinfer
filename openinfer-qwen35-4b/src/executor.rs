@@ -33,9 +33,9 @@ impl RequestId {
 
 #[derive(Clone)]
 pub struct PrefillStepItem {
-    request_id: RequestId,
-    prompt_tokens: Vec<u32>,
-    logprobs: usize,
+    pub(crate) request_id: RequestId,
+    pub(crate) prompt_tokens: Vec<u32>,
+    pub(crate) logprobs: usize,
 }
 
 impl PrefillStepItem {
@@ -50,9 +50,9 @@ impl PrefillStepItem {
 
 #[derive(Clone)]
 pub struct DecodeStepItem {
-    request_id: RequestId,
-    token_id: u32,
-    logprobs: usize,
+    pub(crate) request_id: RequestId,
+    pub(crate) token_id: u32,
+    pub(crate) logprobs: usize,
 }
 
 impl DecodeStepItem {
@@ -89,10 +89,12 @@ pub struct DecodeRequestResult {
     pub logprob: Option<TokenLogprob>,
 }
 
+#[derive(Debug)]
 pub struct PrefillResult {
     pub requests: Vec<PrefillRequestResult>,
 }
 
+#[derive(Debug)]
 pub struct DecodeResult {
     pub requests: Vec<DecodeRequestResult>,
 }
