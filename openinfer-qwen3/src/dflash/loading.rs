@@ -1,14 +1,15 @@
 use anyhow::Context;
 use anyhow::Result;
 use log::debug;
-use openinfer_core::tensor::DeviceContext;
-use openinfer_core::tensor::DeviceMatrix;
-use openinfer_core::weight_loader::deserialize_shards;
-use openinfer_core::weight_loader::load_shard_info;
-use openinfer_core::weight_loader::load_tensor_1d;
-use openinfer_core::weight_loader::load_tensor_2d;
-use openinfer_core::weight_loader::mmap_shards;
-use openinfer_core::weight_loader::precompute_rope;
+
+use crate::config::DFlashConfig;
+use crate::dspark::{MARKOV_W1_TENSOR, MARKOV_W2_TENSOR, MarkovHead};
+use crate::weights::{Attention, MLP, Qwen3Model, TransformerBlock};
+use openinfer_core::tensor::{DeviceContext, DeviceMatrix};
+use openinfer_core::weight_loader::{
+    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_row_shard,
+    mmap_shards, precompute_rope,
+};
 
 use super::DFlashDraftModel;
 use crate::config::DFlashConfig;
@@ -26,7 +27,7 @@ impl DFlashDraftModel {
         model_path: &str,
         target: &Qwen3Model,
     ) -> Result<Self> {
-        let config = DFlashConfig::from_file(model_path)
+        let mut config = DFlashConfig::from_file(model_path)
             .with_context(|| format!("load DFlash config from {model_path}"))?;
         config.validate_for_target(target.config())?;
 
@@ -139,8 +140,22 @@ impl DFlashDraftModel {
         // embed_tokens/lm_head are intentionally skipped: the head is byte-identical
         // to the target's, which we reuse for the verify-equivalent logits.
         let markov = if config.uses_markov_head() {
-            let w1 = load_tensor_2d(ctx, &shards, &weight_map, MARKOV_W1_TENSOR)?;
-            let w2 = load_tensor_2d(ctx, &shards, &weight_map, MARKOV_W2_TENSOR)?;
+            let w1 = load_tensor_2d_row_shard(
+                ctx,
+                &shards,
+                &weight_map,
+                MARKOV_W1_TENSOR,
+                0,
+                config.selection_vocab,
+            )?;
+            let w2 = load_tensor_2d_row_shard(
+                ctx,
+                &shards,
+                &weight_map,
+                MARKOV_W2_TENSOR,
+                0,
+                config.selection_vocab,
+            )?;
             if config.enable_confidence_head {
                 log::info!(
                     "DSpark confidence head present in {model_path} but unused in Phase 1 \

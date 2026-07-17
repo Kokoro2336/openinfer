@@ -7,6 +7,13 @@ use anyhow::Context;
 use anyhow::Result;
 use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::ReduceOp;
+use super::config::{Config, TensorParallelConfig, tokenizer_effective_vocab};
+use std::collections::HashMap;
+
+use crate::lora::{
+    DeviceLoraAdapter, DeviceLoraLayer, DeviceLoraProjection, DeviceLoraTokenGroup,
+    LoraProjectionKind, apply_lora_projection_delta_indexed, apply_lora_projection_delta_range,
+};
 use half::bf16;
 use log::debug;
 use log::info;
@@ -391,7 +398,21 @@ impl Qwen3Model {
         debug!("Initializing GPU device {}", runtime.device_ordinal);
         let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
 
-        let config = Config::from_file(model_path)?;
+        let mut config = Config::from_file(model_path)?;
+        let effective_vocab = tokenizer_effective_vocab(model_path)?;
+        anyhow::ensure!(
+            effective_vocab <= config.vocab_size,
+            "tokenizer defines ids up to {} but checkpoint vocab_size is {}",
+            effective_vocab - 1,
+            config.vocab_size,
+        );
+        config.selection_vocab = effective_vocab;
+        if effective_vocab < config.vocab_size {
+            info!(
+                "output projection: selection bounded to decodable vocab {} (checkpoint pads to {})",
+                effective_vocab, config.vocab_size
+            );
+        }
         let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         tensor_parallel.validate_for(&config)?;
 
