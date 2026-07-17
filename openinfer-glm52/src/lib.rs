@@ -71,10 +71,13 @@ use weights::GLM52_EP_RANKS;
 use weights::Glm52RankLoadBundle;
 use weights::Glm52WeightManifest;
 
-use crate::config::GLM52_MAX_CONTEXT;
-use crate::model::GLM52_MODEL_LEN_ALIGN;
-use crate::model::glm52_arena_bytes;
-use crate::model::glm52_pool_blocks;
+use crate::config::{GLM52_MAX_CONTEXT, GLM52_SELECTION_VOCAB, tokenizer_effective_vocab};
+use crate::model::{GLM52_MODEL_LEN_ALIGN, glm52_arena_bytes, glm52_pool_blocks};
+
+pub use config::{
+    GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_MOE_LAYERS,
+    GLM52_ROUTED_EXPERTS, GLM52_TOPK, GLM52_VOCAB, probe_config_json,
+};
 
 /// GLM5.2 parallel shape. EP8 is the production layout today; TP4 is the
 /// GB300 bring-up target.
@@ -1114,6 +1117,12 @@ fn validate_startup(
     let json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|err| anyhow::anyhow!("parse {}: {err}", config_path.display()))?;
     probe_config_json(&json)?;
+    let tokenizer_vocab = tokenizer_effective_vocab(model_path)?;
+    ensure!(
+        tokenizer_vocab == GLM52_SELECTION_VOCAB,
+        "GLM5.2 tokenizer defines {tokenizer_vocab} selectable ids, this build expects \
+         {GLM52_SELECTION_VOCAB} for its captured output buffers"
+    );
 
     let expected_devices = moe_topo.device_count();
     let remote_ranks: usize = options.rank_hosts.iter().map(|host| host.ranks).sum();

@@ -28,31 +28,19 @@ use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use openinfer_core::cuda_graph::CudaGraphState;
-use openinfer_core::weight_loader::deserialize_shards;
-use openinfer_core::weight_loader::load_shard_info;
-use openinfer_core::weight_loader::load_tensor_1d;
-use openinfer_core::weight_loader::load_tensor_2d;
-use openinfer_core::weight_loader::mmap_shards;
-use openinfer_core::weight_loader::precompute_rope;
-use openinfer_kernels::ops::add_batch_into;
-use openinfer_kernels::ops::copy_hidden_token_range_into;
-use openinfer_kernels::ops::dflash_qk_norm_rope_into;
-use openinfer_kernels::ops::embedding_batch;
-use openinfer_kernels::ops::fused_add_rms_norm_round_batch_into;
-use openinfer_kernels::ops::gemm_into_checked;
-use openinfer_kernels::ops::gemm_rows_into_checked;
-use openinfer_kernels::ops::markov_step_argmax_into;
-use openinfer_kernels::ops::markov_step_argmax_partials_len;
-use openinfer_kernels::ops::rms_norm_batch_into;
-use openinfer_kernels::ops::silu_mul_batch_into;
-use openinfer_kernels::ops::single_prefill_nhd_noncausal_into;
-use openinfer_kernels::tensor::DeviceContext;
-use openinfer_kernels::tensor::DeviceMatrix;
-use openinfer_kernels::tensor::DeviceVec;
-use openinfer_kernels::tensor::HiddenStates;
+use openinfer_core::weight_loader::{
+    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_row_shard,
+    mmap_shards, precompute_rope,
+};
+use openinfer_kernels::ops::{
+    add_batch_into, copy_hidden_token_range_into, dflash_qk_norm_rope_into, embedding_batch,
+    fused_add_rms_norm_round_batch_into, gemm_into_checked, gemm_rows_into_checked,
+    markov_step_argmax_into, markov_step_argmax_partials_len, rms_norm_batch_into,
+    silu_mul_batch_into, single_prefill_nhd_noncausal_into,
+};
+use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
 
-use crate::config::GLM52_HIDDEN;
-use crate::config::GLM52_VOCAB;
+use crate::config::{GLM52_HIDDEN, GLM52_SELECTION_VOCAB, GLM52_VOCAB};
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
 /// Draft block width: anchor + 7 mask positions. Equals the top decode bucket
@@ -110,7 +98,7 @@ const DSPARK_HEAD_DIM: usize = 64;
 const DSPARK_QKV_DIM: usize = DSPARK_HEADS * DSPARK_HEAD_DIM;
 const DSPARK_INTER: usize = 12_288;
 const DSPARK_MARKOV_RANK: usize = 256;
-const DSPARK_MASK_TOKEN: u32 = 154_856;
+const DSPARK_MASK_TOKEN: u32 = GLM52_SELECTION_VOCAB as u32;
 const DSPARK_ROPE_THETA: f32 = 8_000_000.0;
 const DSPARK_RMS_EPS: f32 = 1.0e-5;
 
@@ -135,7 +123,8 @@ pub(crate) struct Glm52DsparkModel {
     hidden_norm: DeviceVec,
     /// Context projection `[6144, 30720]`.
     fc: DeviceMatrix,
-    /// Markov head: `bias(prev) = w2 @ w1[prev]`, both `[154880, 256]`.
+    /// Markov head over selectable tokens:
+    /// `bias(prev) = w2 @ w1[prev]`, both `[154856, 256]`.
     markov_w1: DeviceMatrix,
     markov_w2: DeviceMatrix,
     cos_cache: DeviceVec,
@@ -315,10 +304,34 @@ impl Glm52DsparkModel {
 
         let fc = load_tensor_2d(ctx, &shards, &weight_map, "fc.weight")?;
         ensure_matrix(&fc, "fc", GLM52_HIDDEN, GLM52_DSPARK_CONTEXT_DIM)?;
-        let markov_w1 = load_tensor_2d(ctx, &shards, &weight_map, "markov_head.markov_w1.weight")?;
-        let markov_w2 = load_tensor_2d(ctx, &shards, &weight_map, "markov_head.markov_w2.weight")?;
-        ensure_matrix(&markov_w1, "markov_w1", GLM52_VOCAB, DSPARK_MARKOV_RANK)?;
-        ensure_matrix(&markov_w2, "markov_w2", GLM52_VOCAB, DSPARK_MARKOV_RANK)?;
+        let markov_w1 = load_tensor_2d_row_shard(
+            ctx,
+            &shards,
+            &weight_map,
+            "markov_head.markov_w1.weight",
+            0,
+            GLM52_SELECTION_VOCAB,
+        )?;
+        let markov_w2 = load_tensor_2d_row_shard(
+            ctx,
+            &shards,
+            &weight_map,
+            "markov_head.markov_w2.weight",
+            0,
+            GLM52_SELECTION_VOCAB,
+        )?;
+        ensure_matrix(
+            &markov_w1,
+            "markov_w1",
+            GLM52_SELECTION_VOCAB,
+            DSPARK_MARKOV_RANK,
+        )?;
+        ensure_matrix(
+            &markov_w2,
+            "markov_w2",
+            GLM52_SELECTION_VOCAB,
+            DSPARK_MARKOV_RANK,
+        )?;
 
         // embed_tokens / lm_head / confidence_head are intentionally not
         // loaded: the first two are byte-identical to the target's, the
@@ -697,7 +710,14 @@ impl Glm52DsparkModel {
                                 DSPARK_RMS_EPS,
                                 logits_normed,
                             );
-                            gemm_into_checked(ctx, lm_head, logits_normed, logits)?;
+                            gemm_rows_into_checked(
+                                ctx,
+                                lm_head,
+                                0,
+                                GLM52_SELECTION_VOCAB,
+                                logits_normed,
+                                logits,
+                            )?;
                         });
                     }
                 }
@@ -717,7 +737,14 @@ impl Glm52DsparkModel {
                     layer_tail!(l);
                 }
                 rms_norm_batch_into(ctx, hidden, &self.norm, DSPARK_RMS_EPS, logits_normed);
-                gemm_into_checked(ctx, lm_head, logits_normed, logits)?;
+                gemm_rows_into_checked(
+                    ctx,
+                    lm_head,
+                    0,
+                    GLM52_SELECTION_VOCAB,
+                    logits_normed,
+                    logits,
+                )?;
             }
         }
         if fwd_on {
@@ -929,7 +956,8 @@ impl Glm52DsparkScratch {
         // preallocated so a draft round never touches the allocator (and the
         // VRAM probe's ledger charged exactly this).
         let tail_capacity = cache_len;
-        let partials = markov_step_argmax_partials_len(GLM52_MAX_BATCH_PER_RANK, GLM52_VOCAB);
+        let partials =
+            markov_step_argmax_partials_len(GLM52_MAX_BATCH_PER_RANK, GLM52_SELECTION_VOCAB);
         Ok(Self {
             block_token_ids_h: vec![DSPARK_MASK_TOKEN; max_rows],
             token_ids_d: ctx.stream.alloc_zeros(max_rows)?,
@@ -943,12 +971,12 @@ impl Glm52DsparkScratch {
             up_out: HiddenStates::zeros(ctx, DSPARK_INTER, max_rows)?,
             act_out: HiddenStates::zeros(ctx, DSPARK_INTER, max_rows)?,
             logits_normed: HiddenStates::zeros(ctx, GLM52_HIDDEN, max_rows)?,
-            logits: HiddenStates::zeros(ctx, GLM52_VOCAB, max_rows)?,
+            logits: HiddenStates::zeros(ctx, GLM52_SELECTION_VOCAB, max_rows)?,
             tail_input: HiddenStates::zeros(ctx, GLM52_HIDDEN, tail_capacity)?,
             k_tail: HiddenStates::zeros(ctx, DSPARK_QKV_DIM, tail_capacity)?,
             v_tail: HiddenStates::zeros(ctx, DSPARK_QKV_DIM, tail_capacity)?,
             w1emb: HiddenStates::zeros(ctx, DSPARK_MARKOV_RANK, GLM52_MAX_BATCH_PER_RANK)?,
-            bias: HiddenStates::zeros(ctx, GLM52_VOCAB, GLM52_MAX_BATCH_PER_RANK)?,
+            bias: HiddenStates::zeros(ctx, GLM52_SELECTION_VOCAB, GLM52_MAX_BATCH_PER_RANK)?,
             partial_values: ctx.stream.alloc_zeros(partials)?,
             partial_indices: ctx.stream.alloc_zeros(partials)?,
             prev_tokens: ctx.stream.alloc_zeros(GLM52_MAX_BATCH_PER_RANK)?,
