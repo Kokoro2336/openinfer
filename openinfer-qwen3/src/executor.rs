@@ -18,12 +18,21 @@ use openinfer_core::engine::panic_message;
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_core::tensor::{DeviceContext, DeviceVec, HiddenStates};
-use openinfer_kv_cache::{
-    KvBlockGuard, KvBuffer, KvCacheEvent, KvCacheManager, KvView, LoadReservation, PrefixProbe,
-    RegisteredBlock,
-};
-use openinfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::HiddenStates;
+use openinfer_core::weight_loader::WeightPrefetch;
+use openinfer_core::weight_loader::load_shard_info;
+use openinfer_kv_cache::KvBlockGuard;
+use openinfer_kv_cache::KvBuffer;
+use openinfer_kv_cache::KvCacheEvent;
+use openinfer_kv_cache::KvCacheManager;
+use openinfer_kv_cache::KvView;
+use openinfer_kv_cache::LoadReservation;
+use openinfer_kv_cache::PrefixProbe;
+use openinfer_kv_cache::RegisteredBlock;
+use openinfer_kv_offload::LoadHandle;
+use openinfer_kv_offload::OffloadConfig;
+use openinfer_kv_offload::OffloadEngine;
 use tokio::sync::broadcast;
 
 use crate::Qwen3LoraOptions;
@@ -41,7 +50,9 @@ use crate::weights::Qwen3Model;
 mod dflash_lane;
 mod dflash_prefill;
 mod remote_fetch;
-use remote_fetch::{QueryView, RemoteFetchAction, remote_fetch_action};
+use remote_fetch::QueryView;
+use remote_fetch::RemoteFetchAction;
+use remote_fetch::remote_fetch_action;
 mod spec;
 
 use dflash_lane::DFlashLaneState;

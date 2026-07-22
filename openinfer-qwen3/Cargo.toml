@@ -11,8 +11,6 @@ clap = { workspace = true, optional = true }
 comfy-table = { workspace = true, optional = true }
 crossbeam-channel = { workspace = true }
 cudarc = { workspace = true }
-openinfer-kv-cache = { workspace = true }
-openinfer-kv-offload = { workspace = true }
 fastrace = { workspace = true }
 half = { workspace = true }
 hex = { workspace = true, optional = true }

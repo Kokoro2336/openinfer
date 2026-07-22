@@ -5,11 +5,9 @@ use openinfer_core::engine::TokenSink;
 
 use super::ActiveRequestState;
 use super::PendingRequest;
+use super::PrefixCacheTotals;
 use super::TokenEvent;
 use crate::executor::RequestId;
-use openinfer_core::engine::{FinishReason, TokenLogprob, TokenSink};
-
-use super::{ActiveRequestState, PendingRequest, PrefixCacheTotals, TokenEvent};
 
 pub(super) struct PromptEchoEffect {
     pub(super) token_tx: TokenSink,
