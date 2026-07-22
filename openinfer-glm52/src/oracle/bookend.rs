@@ -26,8 +26,12 @@ use openinfer_kernels::tensor::DeviceVec;
 use sha2::Digest;
 use sha2::Sha256;
 
-use crate::bookend::{glm52_embed_into, glm52_final_norm_into, glm52_lm_head_into};
-use crate::config::{GLM52_HIDDEN, GLM52_SELECTION_VOCAB, GLM52_VOCAB};
+use crate::bookend::glm52_embed_into;
+use crate::bookend::glm52_final_norm_into;
+use crate::bookend::glm52_lm_head_into;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_SELECTION_VOCAB;
+use crate::config::GLM52_VOCAB;
 use crate::rows::Rows;
 
 /// Allocating conveniences over the production `_into` bookends — the gate

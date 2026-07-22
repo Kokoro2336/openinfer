@@ -50,10 +50,15 @@ use openinfer_sample::gpu_sample_batch_into;
 use openinfer_sample::mix_seed;
 
 use crate::bookend::glm52_lm_head_into;
-use crate::config::{
-    GLM52_HIDDEN, GLM52_INDEX_HEAD_DIM, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_ROPE_HALF,
-    GLM52_SELECTION_VOCAB, GLM52_SM_SCALE, GLM52_VOCAB, glm52_layer_has_full_indexer,
-};
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_INDEX_HEAD_DIM;
+use crate::config::GLM52_INDEX_TOPK;
+use crate::config::GLM52_LAYERS;
+use crate::config::GLM52_ROPE_HALF;
+use crate::config::GLM52_SELECTION_VOCAB;
+use crate::config::GLM52_SM_SCALE;
+use crate::config::GLM52_VOCAB;
+use crate::config::glm52_layer_has_full_indexer;
 use crate::indexer::Glm52IndexerScratch;
 use crate::layer::Glm52DecodeStep;
 use crate::layer::Glm52DecoderLayerWeights;

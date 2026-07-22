@@ -7,13 +7,6 @@ use anyhow::Context;
 use anyhow::Result;
 use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::ReduceOp;
-use super::config::{Config, TensorParallelConfig, tokenizer_effective_vocab};
-use std::collections::HashMap;
-
-use crate::lora::{
-    DeviceLoraAdapter, DeviceLoraLayer, DeviceLoraProjection, DeviceLoraTokenGroup,
-    LoraProjectionKind, apply_lora_projection_delta_indexed, apply_lora_projection_delta_range,
-};
 use half::bf16;
 use log::debug;
 use log::info;
@@ -34,6 +27,7 @@ use openinfer_kv_cache::KvBuffer;
 
 use super::config::Config;
 use super::config::TensorParallelConfig;
+use super::config::tokenizer_effective_vocab;
 use crate::batch_decode_buffers::BatchDecodeBuffers;
 use crate::lora::DeviceLoraAdapter;
 use crate::lora::DeviceLoraLayer;

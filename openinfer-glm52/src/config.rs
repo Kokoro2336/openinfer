@@ -1,8 +1,12 @@
 //! GLM5.2 constants and config probing.
 
-use std::{collections::HashSet, path::Path};
+use std::collections::HashSet;
+use std::path::Path;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use serde_json::Value;
 
 pub const GLM52_HIDDEN: usize = 6144;

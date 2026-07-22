@@ -6,11 +6,9 @@
 
 use openinfer_sample::SamplingParams;
 
-use crate::config::GLM52_SELECTION_VOCAB;
-use crate::model::{GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, Glm52StepKv, Glm52StepShape};
-use crate::runner::{Glm52RowSample, Glm52StepFlags};
-
+use super::RankSlots;
 use super::slot::Glm52SlotState;
+use crate::config::GLM52_SELECTION_VOCAB;
 use crate::config::GLM52_VOCAB;
 use crate::model::GLM52_DECODE_BUCKETS;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;

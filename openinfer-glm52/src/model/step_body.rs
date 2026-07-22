@@ -14,8 +14,13 @@ use openinfer_kernels::tensor::DeviceContext;
 use openinfer_kernels::tensor::DeviceMatrix;
 use openinfer_kernels::tensor::DeviceVec;
 
-use crate::bookend::{glm52_embed_into, glm52_final_norm_into, glm52_lm_head_into};
-use crate::config::{GLM52_HIDDEN, GLM52_RMS_EPS, GLM52_SELECTION_VOCAB, GLM52_VOCAB};
+use crate::bookend::glm52_embed_into;
+use crate::bookend::glm52_final_norm_into;
+use crate::bookend::glm52_lm_head_into;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_RMS_EPS;
+use crate::config::GLM52_SELECTION_VOCAB;
+use crate::config::GLM52_VOCAB;
 use crate::dense::glm52_dense_mlp_forward_into;
 use crate::layer::Glm52DecodeStep;
 use crate::layer::Glm52DecoderLayerWeights;

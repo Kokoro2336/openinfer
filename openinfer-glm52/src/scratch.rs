@@ -30,7 +30,9 @@ use openinfer_kernels::ops::Glm52FlashMlaSparseDecode;
 use openinfer_kernels::ops::argmax_batch_bf16_split_partials_len;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::config::{GLM52_DENSE_INTERMEDIATE, GLM52_HIDDEN, GLM52_SELECTION_VOCAB};
+use crate::config::GLM52_DENSE_INTERMEDIATE;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_SELECTION_VOCAB;
 use crate::dspark::GLM52_DSPARK_CONTEXT_DIM;
 use crate::fp8::Glm52MlpScratch;
 use crate::indexer::Glm52IndexerScratch;

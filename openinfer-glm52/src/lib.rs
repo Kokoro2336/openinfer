@@ -71,13 +71,12 @@ use weights::GLM52_EP_RANKS;
 use weights::Glm52RankLoadBundle;
 use weights::Glm52WeightManifest;
 
-use crate::config::{GLM52_MAX_CONTEXT, GLM52_SELECTION_VOCAB, tokenizer_effective_vocab};
-use crate::model::{GLM52_MODEL_LEN_ALIGN, glm52_arena_bytes, glm52_pool_blocks};
-
-pub use config::{
-    GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_MOE_LAYERS,
-    GLM52_ROUTED_EXPERTS, GLM52_TOPK, GLM52_VOCAB, probe_config_json,
-};
+use crate::config::GLM52_MAX_CONTEXT;
+use crate::config::GLM52_SELECTION_VOCAB;
+use crate::config::tokenizer_effective_vocab;
+use crate::model::GLM52_MODEL_LEN_ALIGN;
+use crate::model::glm52_arena_bytes;
+use crate::model::glm52_pool_blocks;
 
 /// GLM5.2 parallel shape. EP8 is the production layout today; TP4 is the
 /// GB300 bring-up target.

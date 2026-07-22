@@ -1,15 +1,15 @@
 use anyhow::Context;
 use anyhow::Result;
 use log::debug;
-
-use crate::config::DFlashConfig;
-use crate::dspark::{MARKOV_W1_TENSOR, MARKOV_W2_TENSOR, MarkovHead};
-use crate::weights::{Attention, MLP, Qwen3Model, TransformerBlock};
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix};
-use openinfer_core::weight_loader::{
-    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_row_shard,
-    mmap_shards, precompute_rope,
-};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::weight_loader::deserialize_shards;
+use openinfer_core::weight_loader::load_shard_info;
+use openinfer_core::weight_loader::load_tensor_1d;
+use openinfer_core::weight_loader::load_tensor_2d;
+use openinfer_core::weight_loader::load_tensor_2d_row_shard;
+use openinfer_core::weight_loader::mmap_shards;
+use openinfer_core::weight_loader::precompute_rope;
 
 use super::DFlashDraftModel;
 use crate::config::DFlashConfig;
