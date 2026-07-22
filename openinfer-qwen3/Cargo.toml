@@ -12,7 +12,7 @@ comfy-table = { workspace = true, optional = true }
 crossbeam-channel = { workspace = true }
 cudarc = { workspace = true }
 openinfer-kv-cache = { workspace = true }
-openinfer-kv-offload = { workspace = true, optional = true }
+openinfer-kv-offload = { workspace = true }
 fastrace = { workspace = true }
 half = { workspace = true }
 hex = { workspace = true, optional = true }
@@ -33,7 +33,6 @@ tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true, optional = true }
 
 [features]
-kv-offload = ["dep:openinfer-kv-offload"]
 kernel-call-trace = ["openinfer-core/kernel-call-trace"]
 kernel-report = [
   "dep:clap",
