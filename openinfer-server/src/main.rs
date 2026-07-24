@@ -74,6 +74,10 @@ async fn main() -> anyhow::Result<()> {
     let port = args.port;
     let frontend_engine_count = 1;
     #[cfg(feature = "glm52")]
+    let glm52_prefill_only = model_type == ModelType::Glm52 && args.glm52_prefill_only;
+    #[cfg(not(feature = "glm52"))]
+    let glm52_prefill_only = false;
+    #[cfg(feature = "glm52")]
     let frontend_engine_count = if model_type == ModelType::Glm52 {
         args.moe_topo
             .parse::<openinfer_glm52::Glm52MoeTopo>()
@@ -121,16 +125,29 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::Ok(handle)
             }
         };
-        openinfer::vllm_frontend::serve_with_engine_count(
-            engine,
-            &model_path,
-            served_model_name.into_iter().collect(),
-            port,
-            None,
-            frontend_engine_count,
-            shutdown,
-        )
-        .await
+        if glm52_prefill_only {
+            openinfer::vllm_frontend::serve_prefill_only_with_engine_count(
+                engine,
+                &model_path,
+                served_model_name.into_iter().collect(),
+                port,
+                None,
+                frontend_engine_count,
+                shutdown,
+            )
+            .await
+        } else {
+            openinfer::vllm_frontend::serve_with_engine_count(
+                engine,
+                &model_path,
+                served_model_name.into_iter().collect(),
+                port,
+                None,
+                frontend_engine_count,
+                shutdown,
+            )
+            .await
+        }
     }
     .context("vLLM frontend server failed");
 
@@ -164,6 +181,11 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     dp_size: args.dp_size.unwrap_or_else(|| moe_topo.default_dp_size()),
                     dspark_draft_model_path: args.dflash_draft_model_path.clone(),
                     max_model_len: args.max_model_len,
+                    prefill_only: args.glm52_prefill_only.then_some(
+                        openinfer_glm52::Glm52PrefillOnlyOptions {
+                            chunk_size: args.glm52_prefill_chunk_size,
+                        },
+                    ),
                     no_prefix_cache: args.no_prefix_cache,
                     kv_offload: args
                         .kv_offload
